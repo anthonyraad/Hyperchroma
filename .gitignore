@@ -1,0 +1,4 @@
+/target
+/renders
+**/*.wav
+!samples/**/*.wav
