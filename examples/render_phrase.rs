@@ -1,12 +1,12 @@
-//! Render a short phrase through the engine to `renders/understory-phrase.wav`.
+//! Render a short phrase through the engine to `renders/hyperchroma-phrase.wav`.
 //! Useful where there is no audio device. Exits quietly when no recordings are embedded.
 
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use understory::bank::load_embedded;
-use understory::engine::{Engine, NoteOn};
+use hyperchroma::bank::load_embedded;
+use hyperchroma::engine::{Engine, NoteOn};
 
 fn main() {
     let bank = load_embedded();
@@ -91,7 +91,7 @@ fn main() {
 
     let dir = Path::new("renders");
     std::fs::create_dir_all(dir).expect("create renders directory");
-    let path = dir.join("understory-phrase.wav");
+    let path = dir.join("hyperchroma-phrase.wav");
     write_wav(&path, sample_rate as u32, &left, &right);
     eprintln!(
         "Wrote {} ({} seconds)",

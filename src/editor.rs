@@ -8,7 +8,7 @@ use nih_plug_egui::widgets;
 use nih_plug_egui::EguiState;
 
 use crate::names::{display_name, note_name, SAMPLE_NAMES};
-use crate::{BankSnapshot, SharedUi, UnderstoryParams};
+use crate::{BankSnapshot, SharedUi, HyperchromaParams};
 
 const INK: Color32 = Color32::from_rgb(24, 32, 28);
 const CREAM: Color32 = Color32::from_rgb(239, 231, 214);
@@ -94,12 +94,12 @@ pub fn draw(
     ctx: &egui::Context,
     setter: &ParamSetter,
     kb: &mut KbState,
-    params: &UnderstoryParams,
+    params: &HyperchromaParams,
     shared: &SharedUi,
     egui_state: &EguiState,
 ) {
     theme(ctx);
-    ResizableWindow::new("understory")
+    ResizableWindow::new("hyperchroma")
         .min_size(Vec2::new(760.0, 560.0))
         .show(ctx, egui_state, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -130,9 +130,9 @@ pub(crate) fn theme(ctx: &egui::Context) {
     ctx.set_visuals(visuals);
 }
 
-fn header(ui: &mut egui::Ui, params: &UnderstoryParams, shared: &SharedUi) {
+fn header(ui: &mut egui::Ui, params: &HyperchromaParams, shared: &SharedUi) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Understory").size(30.0).color(CREAM).strong());
+        ui.label(RichText::new("Hyperchroma").size(30.0).color(CREAM).strong());
         ui.add_space(8.0);
         ui.label(
             RichText::new("random slices, held for the length of the note")
@@ -174,7 +174,7 @@ fn header(ui: &mut egui::Ui, params: &UnderstoryParams, shared: &SharedUi) {
     let ppm = shared.last_ppm.load(Ordering::Relaxed);
     let snap = snapshot(shared);
     let status = if last == u32::MAX {
-        "Play a note. Understory will pick a slice.".to_string()
+        "Play a note. Hyperchroma will pick a slice.".to_string()
     } else {
         let name = snap
             .infos
@@ -206,7 +206,7 @@ fn header(ui: &mut egui::Ui, params: &UnderstoryParams, shared: &SharedUi) {
 fn recordings(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
-    params: &UnderstoryParams,
+    params: &HyperchromaParams,
     shared: &SharedUi,
 ) {
     ui.label(RichText::new("Recordings").size(16.0).color(CREAM).strong());
@@ -273,7 +273,7 @@ fn recordings(
 fn tile(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
-    params: &UnderstoryParams,
+    params: &HyperchromaParams,
     name: &str,
     seconds: Option<f32>,
     enabled: bool,
@@ -387,7 +387,7 @@ fn keyboard(ui: &mut egui::Ui, kb: &mut KbState, root: i32) {
     }
 }
 
-fn shaping(ui: &mut egui::Ui, setter: &ParamSetter, params: &UnderstoryParams, shared: &SharedUi) {
+fn shaping(ui: &mut egui::Ui, setter: &ParamSetter, params: &HyperchromaParams, shared: &SharedUi) {
     ui.label(RichText::new("Shape").size(16.0).color(CREAM).strong());
     ui.label(
         RichText::new(

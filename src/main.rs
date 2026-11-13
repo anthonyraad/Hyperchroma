@@ -1,5 +1,5 @@
 use nih_plug::prelude::*;
 
 fn main() {
-    nih_export_standalone::<understory::Understory>();
+    nih_export_standalone::<hyperchroma::Hyperchroma>();
 }

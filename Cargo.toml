@@ -1,5 +1,5 @@
 [package]
-name = "understory"
+name = "hyperchroma"
 version = "0.1.0"
 edition = "2021"
 authors = ["Raadscapes"]
@@ -14,7 +14,7 @@ members = ["xtask"]
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "understory-standalone"
+name = "hyperchroma-standalone"
 path = "src/main.rs"
 required-features = ["standalone"]
 

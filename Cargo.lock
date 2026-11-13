@@ -1104,6 +1104,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
+name = "hyperchroma"
+version = "0.1.0"
+dependencies = [
+ "nih_plug",
+ "nih_plug_egui",
+ "rtrb 0.3.6",
+ "symphonia",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2686,16 +2696,6 @@ name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
-
-[[package]]
-name = "understory"
-version = "0.1.0"
-dependencies = [
- "nih_plug",
- "nih_plug_egui",
- "rtrb 0.3.6",
- "symphonia",
-]
 
 [[package]]
 name = "unicode-ident"

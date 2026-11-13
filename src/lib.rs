@@ -43,8 +43,8 @@ impl Default for SharedUi {
     }
 }
 
-pub struct Understory {
-    params: Arc<UnderstoryParams>,
+pub struct Hyperchroma {
+    params: Arc<HyperchromaParams>,
     engine: Engine,
     shared: Arc<SharedUi>,
     ui_rx: rtrb::Consumer<UiMidi>,
@@ -55,7 +55,7 @@ pub struct Understory {
 }
 
 #[derive(Params)]
-pub struct UnderstoryParams {
+pub struct HyperchromaParams {
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
 
@@ -118,7 +118,7 @@ pub struct UnderstoryParams {
     pub en_water: BoolParam,
 }
 
-impl UnderstoryParams {
+impl HyperchromaParams {
     pub fn sample_toggle(&self, name: &str) -> Option<&BoolParam> {
         Some(match name {
             "bug" => &self.en_bug,
@@ -151,7 +151,7 @@ impl UnderstoryParams {
     }
 }
 
-impl Default for Understory {
+impl Default for Hyperchroma {
     fn default() -> Self {
         let (tx, rx) = rtrb::RingBuffer::new(128);
         let seed = std::time::SystemTime::now()
@@ -159,7 +159,7 @@ impl Default for Understory {
             .map(|duration| duration.subsec_nanos())
             .unwrap_or(1);
         Self {
-            params: Arc::new(UnderstoryParams::default()),
+            params: Arc::new(HyperchromaParams::default()),
             engine: Engine::new(44_100.0, bank::Bank::empty(), seed),
             shared: Arc::new(SharedUi::default()),
             ui_rx: rx,
@@ -171,7 +171,7 @@ impl Default for Understory {
     }
 }
 
-impl Default for UnderstoryParams {
+impl Default for HyperchromaParams {
     fn default() -> Self {
         Self {
             editor_state: EguiState::from_size(1040, 780),
@@ -254,11 +254,11 @@ impl Default for UnderstoryParams {
     }
 }
 
-impl Plugin for Understory {
-    const NAME: &'static str = "Understory";
+impl Plugin for Hyperchroma {
+    const NAME: &'static str = "Hyperchroma";
     const VENDOR: &'static str = "Raadscapes";
-    const URL: &'static str = "https://example.com/understory";
-    const EMAIL: &'static str = "understory@example.com";
+    const URL: &'static str = "https://example.com/hyperchroma";
+    const EMAIL: &'static str = "hyperchroma@example.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
@@ -438,7 +438,7 @@ impl Plugin for Understory {
     }
 }
 
-impl Understory {
+impl Hyperchroma {
     fn begin_note(&mut self, channel: u8, note: u8, velocity: f32, voice_id: Option<i32>) {
         if !(0..128).contains(&note) {
             return;
@@ -479,8 +479,8 @@ impl Understory {
     }
 }
 
-impl ClapPlugin for Understory {
-    const CLAP_ID: &'static str = "com.raadscapes.understory";
+impl ClapPlugin for Hyperchroma {
+    const CLAP_ID: &'static str = "com.raadscapes.hyperchroma";
     const CLAP_DESCRIPTION: Option<&'static str> = Some(
         "Polyphonic random-slice instrument. Each note plays a random moment from a random recording.",
     );
@@ -493,8 +493,8 @@ impl ClapPlugin for Understory {
     ];
 }
 
-impl Vst3Plugin for Understory {
-    const VST3_CLASS_ID: [u8; 16] = *b"UnderstoryRdsc01";
+impl Vst3Plugin for Hyperchroma {
+    const VST3_CLASS_ID: [u8; 16] = *b"HyperchromaRdsc1";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
         Vst3SubCategory::Instrument,
         Vst3SubCategory::Synth,
@@ -502,8 +502,8 @@ impl Vst3Plugin for Understory {
     ];
 }
 
-nih_export_clap!(Understory);
-nih_export_vst3!(Understory);
+nih_export_clap!(Hyperchroma);
+nih_export_vst3!(Hyperchroma);
 
 fn sanitize_bpm(value: f32) -> f32 {
     if value.is_finite() {

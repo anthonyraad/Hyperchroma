@@ -1,4 +1,4 @@
-/// Recordings shipped with Understory, in grid order.
+/// Recordings shipped with Hyperchroma, in grid order.
 pub const SAMPLE_NAMES: [&str; 18] = [
     "bug", "dark", "dragon", "electric", "fairy", "fighting", "fire", "flying", "ghost", "grass",
     "ground", "ice", "normal", "poison", "psychic", "rock", "steel", "water",

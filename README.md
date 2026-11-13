@@ -1,12 +1,12 @@
-# Understory
+# Hyperchroma
 
-Understory is a polyphonic instrument for ambient and botanica music. Play a note and it picks one of eighteen recordings at random, starts at a random moment inside that recording, and holds the slice until you let go.
+Hyperchroma is a polyphonic instrument for ambient and botanica music. Play a note and it picks one of eighteen recordings at random, starts at a random moment inside that recording, and holds the slice until you let go.
 
 The recordings are in C at 120 BPM. Pitch and tempo are separate: the note you play transposes the slice, and the DAW tempo time-stretches it, so a loop that pulsed at 120 still lands on the grid at 90 or 140 without the key drifting.
 
 ## Play
 
-Load **Understory** as an instrument. It is a VST3 and a CLAP plugin, and it also builds as a standalone app.
+Load **Hyperchroma** as an instrument. It is a VST3 and a CLAP plugin, and it also builds as a standalone app.
 
 - **Original pitch** is the MIDI note that plays a recording untransposed. It defaults to **C4**. The loops are in C; the octave is a guess, so move this if they sit too high or too low against the rest of the track.
 - **Follow the host tempo** reads the session BPM. If the host has not sent a tempo, or you turn the switch off, the **Tempo** knob is used instead.
@@ -42,18 +42,18 @@ sudo apt install pkg-config libgl1-mesa-dev libx11-dev libxcursor-dev \
 
 ```bash
 cargo test
-cargo xtask bundle understory --release
-cargo run --features standalone --bin understory-standalone --release
+cargo xtask bundle hyperchroma --release
+cargo run --features standalone --bin hyperchroma-standalone --release
 cargo run --example render_phrase
 ```
 
-`cargo xtask bundle` writes `target/bundled/Understory.vst3` and `target/bundled/Understory.clap`.
+`cargo xtask bundle` writes `target/bundled/Hyperchroma.vst3` and `target/bundled/Hyperchroma.clap`.
 
 - Linux: copy the bundle to `~/.vst3/` or `~/.clap/`, then rescan.
 - macOS: `~/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/CLAP`. Build on macOS. This tree does not cross-compile a Mac or Windows plugin.
 - Windows: `C:\Program Files\Common Files\VST3` and the CLAP folder your DAW scans. Build on Windows. FL Studio ignores a symlinked VST3; copy the folder.
 
-`render_phrase` writes `renders/understory-phrase.wav` when the recordings are embedded. It is a way to hear the engine with no audio device.
+`render_phrase` writes `renders/hyperchroma-phrase.wav` when the recordings are embedded. It is a way to hear the engine with no audio device.
 
 ## What this version does not do yet
 
