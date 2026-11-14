@@ -20,7 +20,13 @@ A note that is held past the end of a file wraps to the start of that same file,
 
 ## Cubase
 
-A 64-bit Windows VST3 is already built at `dist/Hyperchroma.vst3`. Copy that folder to `C:\Program Files\Common Files\VST3`, then in Cubase open Studio > VST Plug-in Manager and rescan. Cubase can also scan `dist` itself if you add that folder under VST 3 plug-in paths. Hyperchroma then shows up as an instrument.
+Cubase loads this as a VST3 instrument. The Windows 64-bit plugin is `release/Hyperchroma.vst3`, in the same place Sparkletop keeps `release/Sparkletop.vst3`.
+
+1. Copy the whole `Hyperchroma.vst3` folder to `C:\Program Files\Common Files\VST3\`, next to `Sparkletop.vst3`.
+2. In Cubase, open Studio → VST Plug-in Manager and update the plug-in list.
+3. Add an instrument track and choose Hyperchroma. It is an instrument, not an audio effect.
+
+If an earlier copy was scanned and then hidden, open the blocklist in that same manager and remove Hyperchroma before updating again.
 
 ## Recordings
 
@@ -52,7 +58,7 @@ cargo run --example render_phrase
 
 - Linux: copy the bundle to `~/.vst3/` or `~/.clap/`, then rescan.
 - macOS: `~/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/CLAP`. Build on macOS.
-- Windows: `cargo xtask bundle hyperchroma --release` writes `target/bundled/Hyperchroma.vst3`. Copy that folder to `C:\Program Files\Common Files\VST3`. The copy already in `dist/Hyperchroma.vst3` is a 64-bit Windows build. FL Studio ignores a symlinked VST3; copy the folder.
+- Windows: `cargo build --release --target x86_64-pc-windows-gnu`, then copy `target/x86_64-pc-windows-gnu/release/hyperchroma.dll` to `release/Hyperchroma.vst3/Contents/x86_64-win/Hyperchroma.vst3`. The copy already in that folder is the 64-bit Windows build. FL Studio ignores a symlinked VST3; copy the folder.
 
 `render_phrase` writes `renders/hyperchroma-phrase.wav` when the recordings are embedded. It is a way to hear the engine with no audio device.
 
