@@ -2,6 +2,11 @@
 xtask = "run --package xtask --release --"
 
 # Same MinGW link line as Sparkletop, so Cubase can load the plugin without extra DLLs.
+# Windows subsystem: a console DLL makes Cubase's scanner treat the plugin as a crashed tool.
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
-rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-static-libgcc"]
+rustflags = [
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-static-libgcc",
+    "-C", "link-arg=-Wl,--subsystem,windows",
+]

@@ -1,0 +1,31 @@
+{
+  "Name": "Hyperchroma",
+  "Version": "0.1.0",
+  "Factory Info": {
+    "Vendor": "Raadscapes",
+    "URL": "",
+    "E-Mail": "",
+    "Flags": {
+      "Unicode": true,
+      "Classes Discardable": false,
+      "Component Non Discardable": false
+    }
+  },
+  "Classes": [
+    {
+      "CID": "48797065726368726F6D615264736332",
+      "Category": "Audio Module Class",
+      "Name": "Hyperchroma",
+      "Vendor": "Raadscapes",
+      "Version": "0.1.0",
+      "SDKVersion": "VST 3.6.14",
+      "Sub Categories": [
+        "Instrument",
+        "Synth"
+      ],
+      "Class Flags": 2,
+      "Cardinality": 2147483647,
+      "Snapshots": []
+    }
+  ]
+}

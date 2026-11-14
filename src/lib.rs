@@ -261,22 +261,15 @@ impl Default for HyperchromaParams {
 impl Plugin for Hyperchroma {
     const NAME: &'static str = "Hyperchroma";
     const VENDOR: &'static str = "Raadscapes";
-    const URL: &'static str = "https://example.com/hyperchroma";
-    const EMAIL: &'static str = "hyperchroma@example.com";
+    const URL: &'static str = "";
+    const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
-        AudioIOLayout {
-            main_input_channels: None,
-            main_output_channels: NonZeroU32::new(2),
-            ..AudioIOLayout::const_default()
-        },
-        AudioIOLayout {
-            main_input_channels: None,
-            main_output_channels: NonZeroU32::new(1),
-            ..AudioIOLayout::const_default()
-        },
-    ];
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+        main_input_channels: None,
+        main_output_channels: NonZeroU32::new(2),
+        ..AudioIOLayout::const_default()
+    }];
 
     const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
@@ -309,6 +302,8 @@ impl Plugin for Hyperchroma {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
+        // Decoding logs at info. The scanner has nowhere to send that, so keep it quiet.
+        nih_plug::log::set_max_level(nih_plug::log::LevelFilter::Warn);
         self.engine.set_sample_rate(buffer_config.sample_rate);
         if !self.samples_loaded {
             let loaded = bank::load_embedded();
@@ -499,14 +494,15 @@ impl ClapPlugin for Hyperchroma {
 }
 
 impl Vst3Plugin for Hyperchroma {
-    const VST3_CLASS_ID: [u8; 16] = *b"HyperchromaRdsc1";
+    // Rdsc2 replaces Rdsc1, which Cubase blocklisted when the first build failed to scan.
+    const VST3_CLASS_ID: [u8; 16] = *b"HyperchromaRdsc2";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
         Vst3SubCategory::Instrument,
         Vst3SubCategory::Synth,
-        Vst3SubCategory::Sampler,
     ];
 }
 
+#[cfg(not(windows))]
 nih_export_clap!(Hyperchroma);
 nih_export_vst3!(Hyperchroma);
 

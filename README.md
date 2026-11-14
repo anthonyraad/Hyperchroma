@@ -22,11 +22,12 @@ A note that is held past the end of a file wraps to the start of that same file,
 
 Cubase loads this as a VST3 instrument. The Windows 64-bit plugin is `release/Hyperchroma.vst3`, in the same place Sparkletop keeps `release/Sparkletop.vst3`.
 
-1. Copy the whole `Hyperchroma.vst3` folder to `C:\Program Files\Common Files\VST3\`, next to `Sparkletop.vst3`.
-2. In Cubase, open Studio → VST Plug-in Manager and update the plug-in list.
-3. Add an instrument track and choose Hyperchroma. It is an instrument, not an audio effect.
+The first builds never appeared because the DLL imported `api-ms-win-core-synch-l1-2-0.dll`. That name is a Windows API set, not a file in System32. Cubase's scanner points DLL search at the plugin folder and then cannot resolve the API set, so the load fails and the instrument is left off the list. Sparkletop does not fail that lookup. This build imports `WaitOnAddress` from `kernelbase.dll`, a real system DLL the scanner has already loaded, and the bundle includes `Contents/Resources/moduleinfo.json` so Cubase can read the instrument's name and class id.
 
-If an earlier copy was scanned and then hidden, open the blocklist in that same manager and remove Hyperchroma before updating again.
+1. Copy the whole `Hyperchroma.vst3` folder over `C:\Program Files\Common Files\VST3\Hyperchroma.vst3`, next to `Sparkletop.vst3`. Replace the folder that is already there.
+2. In Cubase, open Studio → VST Plug-in Manager. Open the blocklist and remove Hyperchroma if it is listed. A failed scan stays hidden until that entry is gone, even after the file on disk is fixed.
+3. Update the plug-in list.
+4. Add an instrument track and choose Hyperchroma. It is an instrument, not an audio effect.
 
 ## Recordings
 
@@ -58,7 +59,15 @@ cargo run --example render_phrase
 
 - Linux: copy the bundle to `~/.vst3/` or `~/.clap/`, then rescan.
 - macOS: `~/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/CLAP`. Build on macOS.
-- Windows: `cargo build --release --target x86_64-pc-windows-gnu`, then copy `target/x86_64-pc-windows-gnu/release/hyperchroma.dll` to `release/Hyperchroma.vst3/Contents/x86_64-win/Hyperchroma.vst3`. The copy already in that folder is the 64-bit Windows build. FL Studio ignores a symlinked VST3; copy the folder.
+- Windows: `cargo build --release --target x86_64-pc-windows-gnu`, then retarget the sync import and copy the DLL into the bundle:
+
+```bash
+python3 tools/retarget_synch_import.py target/x86_64-pc-windows-gnu/release/hyperchroma.dll
+cp target/x86_64-pc-windows-gnu/release/hyperchroma.dll \
+  release/Hyperchroma.vst3/Contents/x86_64-win/Hyperchroma.vst3
+```
+
+The copy already in that folder is the 64-bit Windows build. FL Studio ignores a symlinked VST3; copy the folder.
 
 `render_phrase` writes `renders/hyperchroma-phrase.wav` when the recordings are embedded. It is a way to hear the engine with no audio device.
 
