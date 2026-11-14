@@ -333,6 +333,10 @@ mod tests {
             "embedded samples failed to decode: {:?}",
             bank.errors
         );
+        assert_eq!(bank.samples.len(), SAMPLE_NAMES.len());
+        for (sample, expected) in bank.samples.iter().zip(SAMPLE_NAMES) {
+            assert_eq!(sample.name, *expected);
+        }
         for sample in &bank.samples {
             assert!(sample.frames > 8, "{}", sample.name);
             assert!(sample.sample_rate >= 8_000.0, "{}", sample.name);

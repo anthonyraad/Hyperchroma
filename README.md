@@ -19,15 +19,11 @@ A note that is held past the end of a file wraps to the start of that same file,
 
 ## Recordings
 
-Put the loops in `samples/` before building. Wav or mp3. The file name is the recording's name:
+The eighteen loops are in `samples/` and are baked into the plugin when you build:
 
-`bug`, `dark`, `dragon`, `electric`, `fairy`, `fighting`, `fire`, `flying`, `ghost`, `grass`, `ground`, `ice`, `normal`, `poison`, `psychic`, `rock`, `steel`, `water`.
+`bug.mp3`, `dark.mp3`, `dragon.mp3`, `electric.mp3`, `fairy.mp3`, `fighting.mp3`, `fire.mp3`, `flying.mp3`, `ghost.mp3`, `grass.mp3`, `ground.mp3`, `ice.mp3`, `normal.mp3`, `poison.mp3`, `psychic.mp3`, `rock.mp3`, `steel.mp3`, `water.mp3`.
 
-A hashed upload name such as `fairy_08ef.mp3` is accepted too. On load, each file is peak-normalized so one recording does not bury the others. Rebuild after adding or replacing a file; the audio is baked into the plugin.
-
-```bash
-python3 tools/import_uploads.py   # copies /workspace/uploads when that folder exists
-```
+A hashed upload name such as `fairy_08ef.mp3` is accepted too, if you drop a replacement into that folder. On load, each file is peak-normalized so one recording does not bury the others. Rebuild after replacing a file; the audio is compiled into the plugin.
 
 ## Build
 
