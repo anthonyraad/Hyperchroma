@@ -18,6 +18,10 @@ Load **Hyperchroma** as an instrument. It is a VST3 and a CLAP plugin, and it al
 
 A note that is held past the end of a file wraps to the start of that same file, so a long chord can drone. Sixteen notes can sound at once. The newest matching note-off releases one voice.
 
+## Cubase
+
+A 64-bit Windows VST3 is already built at `dist/Hyperchroma.vst3`. Copy that folder to `C:\Program Files\Common Files\VST3`, then in Cubase open Studio > VST Plug-in Manager and rescan. Cubase can also scan `dist` itself if you add that folder under VST 3 plug-in paths. Hyperchroma then shows up as an instrument.
+
 ## Recordings
 
 The eighteen loops are in `samples/` and are baked into the plugin when you build:
@@ -47,8 +51,8 @@ cargo run --example render_phrase
 `cargo xtask bundle` writes `target/bundled/Hyperchroma.vst3` and `target/bundled/Hyperchroma.clap`.
 
 - Linux: copy the bundle to `~/.vst3/` or `~/.clap/`, then rescan.
-- macOS: `~/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/CLAP`. Build on macOS. This tree does not cross-compile a Mac or Windows plugin.
-- Windows: `C:\Program Files\Common Files\VST3` and the CLAP folder your DAW scans. Build on Windows. FL Studio ignores a symlinked VST3; copy the folder.
+- macOS: `~/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/CLAP`. Build on macOS.
+- Windows: `cargo xtask bundle hyperchroma --release` writes `target/bundled/Hyperchroma.vst3`. Copy that folder to `C:\Program Files\Common Files\VST3`. The copy already in `dist/Hyperchroma.vst3` is a 64-bit Windows build. FL Studio ignores a symlinked VST3; copy the folder.
 
 `render_phrase` writes `renders/hyperchroma-phrase.wav` when the recordings are embedded. It is a way to hear the engine with no audio device.
 
