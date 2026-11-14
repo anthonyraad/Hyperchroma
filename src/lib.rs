@@ -71,6 +71,9 @@ pub struct HyperchromaParams {
     #[id = "root"]
     pub root: IntParam,
 
+    #[id = "keytrack"]
+    pub keytrack: BoolParam,
+
     #[id = "tempo"]
     pub tempo: FloatParam,
 
@@ -211,6 +214,7 @@ impl Default for HyperchromaParams {
             root: IntParam::new("Original pitch", 60, IntRange::Linear { min: 0, max: 127 })
                 .with_value_to_string(Arc::new(|value| note_name(value)))
                 .with_string_to_value(Arc::new(|text| parse_note(text))),
+            keytrack: BoolParam::new("Keytracking", false),
             tempo: FloatParam::new(
                 "Tempo",
                 120.0,
@@ -353,6 +357,7 @@ impl Plugin for Hyperchroma {
 
         let mut next_event = context.next_event();
         let root = self.params.root.value();
+        let keytrack = self.params.keytrack.value();
         let follow = self.params.sync.value();
         let manual = sanitize_bpm(self.params.tempo.value());
         let sample_bpm = sanitize_bpm(self.params.sample_bpm.value());
@@ -404,7 +409,7 @@ impl Plugin for Hyperchroma {
             }
 
             let gain = util::db_to_gain(self.params.gain.smoothed.next());
-            let (left, right) = self.engine.render(root, tempo_ratio);
+            let (left, right) = self.engine.render(root, tempo_ratio, keytrack);
             let left = shape(left * gain * BUS_TRIM);
             let right = shape(right * gain * BUS_TRIM);
             let mut channel_index = 0;

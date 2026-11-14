@@ -2,13 +2,14 @@
 
 Hyperchroma is a polyphonic instrument for ambient and botanica music. Play a note and it picks one of eighteen recordings at random, starts at a random moment inside that recording, and holds the slice until you let go.
 
-The recordings are in C at 120 BPM. Pitch and tempo are separate: the note you play transposes the slice, and the DAW tempo time-stretches it, so a loop that pulsed at 120 still lands on the grid at 90 or 140 without the key drifting.
+The recordings are in C at 120 BPM. Pitch and tempo are separate. With keytracking off, every note plays the recording transposed to Original pitch, so a loop in C stays in C no matter which key you hold. Turn keytracking on and the note you play transposes it. The DAW tempo time-stretches the slice either way, so a loop that pulsed at 120 still lands on the grid at 90 or 140.
 
 ## Play
 
 Load **Hyperchroma** as an instrument. It is a VST3 and a CLAP plugin, and it also builds as a standalone app.
 
-- **Original pitch** is the MIDI note that plays a recording untransposed. It defaults to **C4**. The loops are in C; the octave is a guess, so move this if they sit too high or too low against the rest of the track.
+- **Keytracking** is off by default. Every note plays at **Original pitch**, and the key you hold only picks a slice. **C4** leaves the loops as recorded. **D4** raises every note a whole step. **C3** drops every note an octave.
+- Turn **Keytracking** on and the note you play transposes around Original pitch. That note is the one that leaves a recording untransposed. It defaults to **C4**.
 - **Follow the host tempo** reads the session BPM. If the host has not sent a tempo, or you turn the switch off, the **Tempo** knob is used instead.
 - **Sample BPM** is the tempo the recordings were played at. Leave it at 120 unless that turns out to be wrong.
 - **Attack** and **Release** shape the swell. Release defaults to 800 ms so a lifted key still breathes.

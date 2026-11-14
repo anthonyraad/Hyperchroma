@@ -102,7 +102,7 @@ fn main() {
 
 fn render(engine: &mut Engine, left: &mut Vec<f32>, right: &mut Vec<f32>, frames: usize) {
     for _ in 0..frames {
-        let (l, r) = engine.render(60, 1.0);
+        let (l, r) = engine.render(60, 1.0, true);
         left.push(l * 0.5);
         right.push(r * 0.5);
     }

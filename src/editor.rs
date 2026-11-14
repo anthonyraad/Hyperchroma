@@ -8,7 +8,7 @@ use nih_plug_egui::widgets;
 use nih_plug_egui::EguiState;
 
 use crate::names::{display_name, note_name, SAMPLE_NAMES};
-use crate::{BankSnapshot, SharedUi, HyperchromaParams};
+use crate::{BankSnapshot, HyperchromaParams, SharedUi};
 
 const INK: Color32 = Color32::from_rgb(24, 32, 28);
 const CREAM: Color32 = Color32::from_rgb(239, 231, 214);
@@ -132,7 +132,12 @@ pub(crate) fn theme(ctx: &egui::Context) {
 
 fn header(ui: &mut egui::Ui, params: &HyperchromaParams, shared: &SharedUi) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Hyperchroma").size(30.0).color(CREAM).strong());
+        ui.label(
+            RichText::new("Hyperchroma")
+                .size(30.0)
+                .color(CREAM)
+                .strong(),
+        );
         ui.add_space(8.0);
         ui.label(
             RichText::new("random slices, held for the length of the note")
@@ -144,13 +149,21 @@ fn header(ui: &mut egui::Ui, params: &HyperchromaParams, shared: &SharedUi) {
     ui.add_space(4.0);
     ui.label(
         RichText::new(
-            "Each note chooses one recording and a moment inside it. Pitch follows the key. Time follows the tempo.",
+            "Each note chooses one recording and a moment inside it. Time follows the tempo.",
         )
         .size(13.0)
         .color(CREAM),
     );
 
-    let root = note_name(params.root.value());
+    let root_note = params.root.value();
+    let root = note_name(root_note);
+    let pitch_line = if params.keytrack.value() {
+        format!("{root} is untransposed. The note you play moves the pitch.")
+    } else if root_note == 60 {
+        "Every note plays the recordings as they are, in C.".to_string()
+    } else {
+        format!("Every note is transposed to {root}, no matter which key you hold.")
+    };
     let host = shared.host_bpm_x100.load(Ordering::Relaxed);
     let manual = params.tempo.value();
     let tempo_line = if params.sync.value() {
@@ -164,7 +177,7 @@ fn header(ui: &mut egui::Ui, params: &HyperchromaParams, shared: &SharedUi) {
     };
     ui.add_space(6.0);
     ui.label(
-        RichText::new(format!("{root} is the original pitch  ·  {tempo_line}"))
+        RichText::new(format!("{pitch_line}  ·  {tempo_line}"))
             .size(13.0)
             .color(POLLEN),
     );
@@ -391,7 +404,7 @@ fn shaping(ui: &mut egui::Ui, setter: &ParamSetter, params: &HyperchromaParams, 
     ui.label(RichText::new("Shape").size(16.0).color(CREAM).strong());
     ui.label(
         RichText::new(
-            "The recordings are in C at 120 BPM. Original pitch is the note that leaves them there. Sample BPM is the tempo they were played at.",
+            "The recordings are in C at 120 BPM. Original pitch is where they sit. Sample BPM is the tempo they were played at.",
         )
         .size(12.0)
         .color(MUTED),
@@ -407,6 +420,17 @@ fn shaping(ui: &mut egui::Ui, setter: &ParamSetter, params: &HyperchromaParams, 
             knob(ui, setter, "Sample BPM", &params.sample_bpm);
             knob(ui, setter, "Tempo", &params.tempo);
         });
+
+    let mut track = params.keytrack.value();
+    if ui.checkbox(&mut track, "Keytracking").changed() {
+        set_bool(setter, &params.keytrack, track);
+    }
+    let track_copy = if track {
+        "The note you play transposes the recording. Original pitch is the note that leaves it as recorded."
+    } else {
+        "Every note plays at Original pitch. C4 leaves the recordings as they are."
+    };
+    ui.label(RichText::new(track_copy).size(12.0).color(MUTED));
 
     let mut follow = params.sync.value();
     if ui.checkbox(&mut follow, "Follow the host tempo").changed() {

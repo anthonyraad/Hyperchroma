@@ -289,7 +289,9 @@ impl Engine {
 
     /// Mix every sounding voice for one output frame.
     /// `tempo_ratio` is host BPM divided by the recording BPM. Pitch is independent of it.
-    pub fn render(&mut self, root: i32, tempo_ratio: f32) -> (f32, f32) {
+    /// With keytracking on, the played note transposes around `root`. With it off, every note
+    /// sounds at `root`, measured from C4, which is how the recordings were played.
+    pub fn render(&mut self, root: i32, tempo_ratio: f32, keytrack: bool) -> (f32, f32) {
         let tempo_ratio = if tempo_ratio.is_finite() {
             tempo_ratio.clamp(0.05, 8.0)
         } else {
@@ -301,7 +303,7 @@ impl Engine {
             if !self.voices[index].active {
                 continue;
             }
-            let (voice_l, voice_r) = self.render_voice(index, root, tempo_ratio);
+            let (voice_l, voice_r) = self.render_voice(index, root, tempo_ratio, keytrack);
             left += voice_l;
             right += voice_r;
         }
@@ -383,7 +385,13 @@ impl Engine {
         best
     }
 
-    fn render_voice(&mut self, index: usize, root: i32, tempo_ratio: f32) -> (f32, f32) {
+    fn render_voice(
+        &mut self,
+        index: usize,
+        root: i32,
+        tempo_ratio: f32,
+        keytrack: bool,
+    ) -> (f32, f32) {
         advance_env(&mut self.voices[index]);
         if !self.voices[index].active {
             return (0.0, 0.0);
@@ -423,7 +431,7 @@ impl Engine {
             until_next = hop;
         }
 
-        let pitch = pitch_ratio(note, root, tuning);
+        let pitch = pitch_ratio(note, root, tuning, keytrack);
         let read_inc = pitch as f64 * sr_ratio;
         let mut left = 0.0f32;
         let mut right = 0.0f32;
@@ -451,8 +459,15 @@ impl Engine {
     }
 }
 
-fn pitch_ratio(note: u8, root: i32, tuning: f32) -> f32 {
-    let semis = note as f32 - root as f32 + tuning;
+/// C4 is the untransposed pitch of the recordings.
+const SAMPLE_MIDI: f32 = 60.0;
+
+fn pitch_ratio(note: u8, root: i32, tuning: f32, keytrack: bool) -> f32 {
+    let semis = if keytrack {
+        note as f32 - root as f32 + tuning
+    } else {
+        root as f32 - SAMPLE_MIDI + tuning
+    };
     2.0f32.powf(semis / 12.0)
 }
 
@@ -547,7 +562,7 @@ mod tests {
     fn render_for(engine: &mut Engine, frames: usize, root: i32, tempo: f32) -> Vec<f32> {
         let mut out = Vec::with_capacity(frames);
         for _ in 0..frames {
-            out.push(engine.render(root, tempo).0);
+            out.push(engine.render(root, tempo, true).0);
         }
         out
     }
@@ -659,6 +674,58 @@ mod tests {
     }
 
     #[test]
+    fn keytracking_off_uses_the_set_key_for_every_note() {
+        let measure = |note: u8, root: i32| -> f32 {
+            let mut engine = Engine::new(44_100.0, tone_bank(), 1);
+            engine
+                .note_on(
+                    NoteOn {
+                        note,
+                        velocity: 1.0,
+                        channel: 0,
+                        voice_id: None,
+                        sample: Some(0),
+                        start_norm: Some(0.0),
+                    },
+                    &[true, true],
+                    1.0,
+                )
+                .unwrap();
+            let mut out = Vec::with_capacity(44_100);
+            for _ in 0..44_100 {
+                out.push(engine.render(root, 1.0, false).0);
+            }
+            let grain = engine.grain_len;
+            frequency(&out[grain..grain + 12_000], 44_100.0)
+        };
+
+        let low = measure(48, 60);
+        let high = measure(72, 60);
+        assert!(
+            (low - 220.0).abs() < 8.0,
+            "C3 should play the recording as it is, got {low}"
+        );
+        assert!(
+            (high - 220.0).abs() < 8.0,
+            "C5 should play the recording as it is, got {high}"
+        );
+
+        let whole_step = 220.0 * 2.0f32.powf(2.0 / 12.0);
+        let to_d = measure(48, 62);
+        assert!(
+            (to_d - whole_step).abs() < 8.0,
+            "D4 should transpose every note the same amount, got {to_d}"
+        );
+
+        let octave_down = measure(72, 48);
+        let ratio = octave_down / high;
+        assert!(
+            (ratio - 0.5).abs() < 0.08,
+            "C3 as the set key should drop every note an octave, got {octave_down} Hz (ratio {ratio})"
+        );
+    }
+
+    #[test]
     fn host_sample_rate_does_not_change_pitch() {
         let mut engine = Engine::new(48_000.0, tone_bank(), 3);
         engine
@@ -741,7 +808,7 @@ mod tests {
             seen_samples[triggered.sample] = true;
             starts.push(triggered.start_norm);
             engine.note_off(0, 60, None, 1.0);
-            let _ = engine.render(60, 1.0);
+            let _ = engine.render(60, 1.0, true);
             engine.silence();
             let _ = i;
         }
@@ -775,7 +842,7 @@ mod tests {
             )
             .unwrap();
         for _ in 0..(44_100 / 2) {
-            let (left, right) = engine.render(60, 1.2);
+            let (left, right) = engine.render(60, 1.2, true);
             assert!(left.is_finite() && right.is_finite());
             assert!(left.abs() < 2.0 && right.abs() < 2.0);
         }
