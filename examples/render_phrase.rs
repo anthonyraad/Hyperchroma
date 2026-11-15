@@ -26,7 +26,7 @@ fn main() {
     let release = 0.7 * sample_rate;
     let mut left = Vec::new();
     let mut right = Vec::new();
-    let enabled = [true; 32];
+    let weights = [1.0f32; 32];
 
     let melody = [60u8, 64, 67, 72, 71, 67, 64, 60];
     for note in melody {
@@ -40,7 +40,8 @@ fn main() {
                     sample: None,
                     start_norm: None,
                 },
-                &enabled,
+                &weights,
+                &[],
                 attack,
             )
             .expect("a recording is enabled");
@@ -69,7 +70,8 @@ fn main() {
                 sample: None,
                 start_norm: None,
             },
-            &enabled,
+            &weights,
+                &[],
             attack,
         );
     }

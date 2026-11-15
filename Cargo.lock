@@ -1109,7 +1109,6 @@ version = "0.1.0"
 dependencies = [
  "nih_plug",
  "nih_plug_egui",
- "rtrb 0.3.6",
  "symphonia",
 ]
 
@@ -1546,7 +1545,7 @@ dependencies = [
  "objc",
  "parking_lot",
  "raw-window-handle 0.5.2",
- "rtrb 0.2.3",
+ "rtrb",
  "serde",
  "serde_json",
  "vst3-sys",
@@ -2184,12 +2183,6 @@ checksum = "99e704dd104faf2326a320140f70f0b736d607c1caa1b1748a6c568a79819109"
 dependencies = [
  "cache-padded",
 ]
-
-[[package]]
-name = "rtrb"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "342e1478a6e1c839e7405033eabfdc954d4d5dabd39f34e83420a43a95acfb04"
 
 [[package]]
 name = "rustc-demangle"

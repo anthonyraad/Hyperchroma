@@ -1,7 +1,7 @@
 /// Recordings shipped with Hyperchroma, in grid order.
-pub const SAMPLE_NAMES: [&str; 18] = [
+pub const SAMPLE_NAMES: [&str; 20] = [
     "bug", "dark", "dragon", "electric", "fairy", "fighting", "fire", "flying", "ghost", "grass",
-    "ground", "ice", "normal", "poison", "psychic", "rock", "steel", "water",
+    "ground", "ice", "normal", "poison", "psychic", "rock", "steel", "water", "sage", "clay",
 ];
 
 const PITCH_CLASS: [&str; 12] = [

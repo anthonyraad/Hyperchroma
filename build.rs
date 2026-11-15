@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Canonical recording names, in the order they appear in the instrument.
-const NAMES: [&str; 18] = [
+const NAMES: [&str; 20] = [
     "bug", "dark", "dragon", "electric", "fairy", "fighting", "fire", "flying", "ghost", "grass",
-    "ground", "ice", "normal", "poison", "psychic", "rock", "steel", "water",
+    "ground", "ice", "normal", "poison", "psychic", "rock", "steel", "water", "sage", "clay",
 ];
 
 fn main() {

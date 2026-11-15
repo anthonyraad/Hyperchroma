@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::DecoderOptions;
@@ -110,9 +111,15 @@ impl Bank {
     }
 }
 
+/// Peak bins stored for the editor waveform. Built once, when the bank loads.
+pub const WAVE_BINS: usize = 480;
+
+#[derive(Clone)]
 pub struct SampleInfo {
     pub name: String,
     pub seconds: f32,
+    pub wave_min: Arc<[f32]>,
+    pub wave_max: Arc<[f32]>,
 }
 
 #[derive(Clone, Default)]
@@ -121,28 +128,82 @@ pub struct BankSnapshot {
     pub errors: Vec<String>,
 }
 
-impl Clone for SampleInfo {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            seconds: self.seconds,
+impl Bank {
+    pub fn snapshot(&self) -> BankSnapshot {
+        BankSnapshot {
+            infos: self.samples.iter().map(sample_info).collect(),
+            errors: self.errors.clone(),
         }
     }
 }
 
-impl Bank {
-    pub fn snapshot(&self) -> BankSnapshot {
-        BankSnapshot {
-            infos: self
-                .samples
-                .iter()
-                .map(|sample| SampleInfo {
-                    name: sample.name.clone(),
-                    seconds: sample.seconds(),
-                })
-                .collect(),
-            errors: self.errors.clone(),
+fn sample_info(sample: &Pcm) -> SampleInfo {
+    let (wave_min, wave_max) = waveform(sample);
+    SampleInfo {
+        name: sample.name.clone(),
+        seconds: sample.seconds(),
+        wave_min: Arc::from(wave_min),
+        wave_max: Arc::from(wave_max),
+    }
+}
+
+/// Min and max amplitude in each bin, so the editor can draw the recording's shape.
+fn waveform(pcm: &Pcm) -> (Vec<f32>, Vec<f32>) {
+    let mut mins = vec![0.0; WAVE_BINS];
+    let mut maxs = vec![0.0; WAVE_BINS];
+    if pcm.frames == 0 || pcm.data.is_empty() {
+        return (mins, maxs);
+    }
+    for bin in 0..WAVE_BINS {
+        let start = bin * pcm.frames / WAVE_BINS;
+        let end = ((bin + 1) * pcm.frames / WAVE_BINS)
+            .max(start + 1)
+            .min(pcm.frames);
+        let mut min_v = 0.0f32;
+        let mut max_v = 0.0f32;
+        for frame in start..end {
+            let sample = frame_mono(pcm, frame);
+            min_v = min_v.min(sample);
+            max_v = max_v.max(sample);
         }
+        mins[bin] = min_v;
+        maxs[bin] = max_v;
+    }
+    smooth_loop(&mut mins);
+    smooth_loop(&mut maxs);
+    for (min_v, max_v) in mins.iter_mut().zip(maxs.iter_mut()) {
+        if *min_v > *max_v {
+            let mid = 0.5 * (*min_v + *max_v);
+            *min_v = mid;
+            *max_v = mid;
+        }
+    }
+    (mins, maxs)
+}
+
+fn frame_mono(pcm: &Pcm, frame: usize) -> f32 {
+    if pcm.channels <= 1 {
+        pcm.data.get(frame).copied().unwrap_or(0.0)
+    } else {
+        let index = frame.saturating_mul(2);
+        match (pcm.data.get(index), pcm.data.get(index + 1)) {
+            (Some(left), Some(right)) => 0.5 * (left + right),
+            (Some(left), None) => *left,
+            _ => 0.0,
+        }
+    }
+}
+
+fn smooth_loop(values: &mut [f32]) {
+    if values.len() < 3 {
+        return;
+    }
+    let original = values.to_vec();
+    let last = original.len() - 1;
+    for index in 0..original.len() {
+        let prev = if index == 0 { original[last] } else { original[index - 1] };
+        let next = if index == last { original[0] } else { original[index + 1] };
+        values[index] = prev * 0.22 + original[index] * 0.56 + next * 0.22;
     }
 }
 
@@ -346,6 +407,14 @@ mod tests {
                 .fold(0.0f32, |peak, value| peak.max(value.abs()));
             assert!(peak <= 0.92, "{} peak {peak}", sample.name);
             assert!(peak > 0.2, "{} was silent after normalize", sample.name);
+        }
+        let snap = bank.snapshot();
+        assert_eq!(snap.infos.len(), SAMPLE_NAMES.len());
+        for info in &snap.infos {
+            assert_eq!(info.wave_min.len(), WAVE_BINS, "{}", info.name);
+            assert_eq!(info.wave_max.len(), WAVE_BINS, "{}", info.name);
+            let peak = info.wave_max.iter().copied().fold(0.0f32, f32::max);
+            assert!(peak > 0.05, "{} waveform was silent", info.name);
         }
     }
 }

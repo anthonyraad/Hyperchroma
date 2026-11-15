@@ -7,7 +7,7 @@ use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
 
 use crate::bank::BankSnapshot;
-use crate::engine::{Engine, NoteOn};
+use crate::engine::{Engine, GlobalRoll, NoteOn, SliceRolls};
 use crate::names::{note_name, parse_note};
 
 pub mod bank;
@@ -15,9 +15,11 @@ mod editor;
 pub mod engine;
 pub mod names;
 
-use editor::{KbState, UiMidi};
+use editor::KbState;
 
 const BUS_TRIM: f32 = 0.5;
+
+const SAMPLE_SLOTS: usize = 32;
 
 pub struct SharedUi {
     pub snapshot: Mutex<BankSnapshot>,
@@ -27,6 +29,10 @@ pub struct SharedUi {
     pub active_mask: AtomicU32,
     pub voices: AtomicU32,
     pub host_bpm_x100: AtomicU32,
+    /// Bank slot the editor asked to audition, or `u32::MAX` when idle.
+    pub preview_slot: AtomicU32,
+    /// Playhead in parts per million, or `u32::MAX` when that recording is silent.
+    pub playhead_ppm: [AtomicU32; SAMPLE_SLOTS],
 }
 
 impl Default for SharedUi {
@@ -39,6 +45,8 @@ impl Default for SharedUi {
             active_mask: AtomicU32::new(0),
             voices: AtomicU32::new(0),
             host_bpm_x100: AtomicU32::new(0),
+            preview_slot: AtomicU32::new(u32::MAX),
+            playhead_ppm: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
         }
     }
 }
@@ -47,16 +55,122 @@ pub struct Hyperchroma {
     params: Arc<HyperchromaParams>,
     engine: Engine,
     shared: Arc<SharedUi>,
-    ui_rx: rtrb::Consumer<UiMidi>,
-    ui_tx: Arc<Mutex<rtrb::Producer<UiMidi>>>,
     samples_loaded: bool,
     meter: f32,
     peak_decay: f32,
+    /// Samples left in the editor's audition, and whether one is sounding.
+    preview_left: u32,
+    preview_on: bool,
+}
+
+#[derive(Params)]
+pub struct SliceParams {
+    #[id = "prob"]
+    pub probability: FloatParam,
+
+    #[id = "rev"]
+    pub reverse: FloatParam,
+
+    #[id = "pan"]
+    pub pan: FloatParam,
+
+    #[id = "oct"]
+    pub octave: FloatParam,
+}
+
+impl SliceParams {
+    fn new() -> Self {
+        Self {
+            probability: percent_param("Luck", 1.0),
+            reverse: percent_param("Reverse", 0.0),
+            pan: FloatParam::new(
+                "Spread",
+                0.0,
+                FloatRange::Linear {
+                    min: -1.0,
+                    max: 1.0,
+                },
+            )
+            .with_step_size(0.01)
+            .with_value_to_string(Arc::new(pan_text))
+            .with_string_to_value(Arc::new(pan_parse)),
+            octave: percent_param("Leap", 0.0),
+        }
+    }
+}
+
+fn percent_param(name: &str, default: f32) -> FloatParam {
+    FloatParam::new(
+        name,
+        default,
+        FloatRange::Linear {
+            min: 0.0,
+            max: 1.0,
+        },
+    )
+    .with_step_size(0.01)
+    .with_value_to_string(Arc::new(percent_text))
+    .with_string_to_value(Arc::new(percent_parse))
+}
+
+fn percent_text(value: f32) -> String {
+    format!("{}%", (value.clamp(0.0, 1.0) * 100.0).round() as i32)
+}
+
+fn percent_parse(text: &str) -> Option<f32> {
+    let trimmed = text.trim();
+    let marked = trimmed.ends_with('%');
+    let number: f32 = trimmed.trim_end_matches('%').trim().parse().ok()?;
+    let value = if marked || number > 1.0 {
+        number / 100.0
+    } else {
+        number
+    };
+    (0.0..=1.0).contains(&value).then_some(value)
+}
+
+fn pan_text(value: f32) -> String {
+    let percent = (value.abs().clamp(0.0, 1.0) * 100.0).round() as i32;
+    if percent == 0 {
+        "Center".to_string()
+    } else if value < 0.0 {
+        format!("L {percent}%")
+    } else {
+        format!("R {percent}%")
+    }
+}
+
+fn pan_parse(text: &str) -> Option<f32> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("center")
+        || trimmed.eq_ignore_ascii_case("c")
+        || trimmed == "0"
+    {
+        return Some(0.0);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (sign, rest) = if let Some(rest) = lower.strip_prefix("l") {
+        (-1.0, rest)
+    } else if let Some(rest) = lower.strip_prefix("r") {
+        (1.0, rest)
+    } else if let Some(rest) = lower.strip_prefix('-') {
+        (-1.0, rest)
+    } else {
+        (1.0, lower.as_str())
+    };
+    let number: f32 = rest
+        .trim()
+        .trim_end_matches('%')
+        .trim()
+        .parse()
+        .ok()?;
+    let magnitude = if number > 1.0 { number / 100.0 } else { number };
+    Some((sign * magnitude).clamp(-1.0, 1.0))
 }
 
 #[derive(Params)]
 pub struct HyperchromaParams {
-    #[persist = "editor-state"]
+    #[persist = "editor-state-3"]
     editor_state: Arc<EguiState>,
 
     #[id = "gain"]
@@ -83,80 +197,93 @@ pub struct HyperchromaParams {
     #[id = "sync"]
     pub sync: BoolParam,
 
-    #[id = "en_bug"]
-    pub en_bug: BoolParam,
-    #[id = "en_dark"]
-    pub en_dark: BoolParam,
-    #[id = "en_dragon"]
-    pub en_dragon: BoolParam,
-    #[id = "en_electric"]
-    pub en_electric: BoolParam,
-    #[id = "en_fairy"]
-    pub en_fairy: BoolParam,
-    #[id = "en_fighting"]
-    pub en_fighting: BoolParam,
-    #[id = "en_fire"]
-    pub en_fire: BoolParam,
-    #[id = "en_flying"]
-    pub en_flying: BoolParam,
-    #[id = "en_ghost"]
-    pub en_ghost: BoolParam,
-    #[id = "en_grass"]
-    pub en_grass: BoolParam,
-    #[id = "en_ground"]
-    pub en_ground: BoolParam,
-    #[id = "en_ice"]
-    pub en_ice: BoolParam,
-    #[id = "en_normal"]
-    pub en_normal: BoolParam,
-    #[id = "en_poison"]
-    pub en_poison: BoolParam,
-    #[id = "en_psychic"]
-    pub en_psychic: BoolParam,
-    #[id = "en_rock"]
-    pub en_rock: BoolParam,
-    #[id = "en_steel"]
-    pub en_steel: BoolParam,
-    #[id = "en_water"]
-    pub en_water: BoolParam,
+    #[id = "swell"]
+    pub swell: FloatParam,
+
+    #[id = "crush"]
+    pub crush: FloatParam,
+
+    #[id = "pass"]
+    pub pass: FloatParam,
+
+    #[id = "stutter"]
+    pub stutter: FloatParam,
+
+    #[id = "smear"]
+    pub smear: FloatParam,
+
+    #[nested(id_prefix = "bug", group = "Bug")]
+    pub bug: SliceParams,
+    #[nested(id_prefix = "dark", group = "Dark")]
+    pub dark: SliceParams,
+    #[nested(id_prefix = "dragon", group = "Dragon")]
+    pub dragon: SliceParams,
+    #[nested(id_prefix = "electric", group = "Electric")]
+    pub electric: SliceParams,
+    #[nested(id_prefix = "fairy", group = "Fairy")]
+    pub fairy: SliceParams,
+    #[nested(id_prefix = "fighting", group = "Fighting")]
+    pub fighting: SliceParams,
+    #[nested(id_prefix = "fire", group = "Fire")]
+    pub fire: SliceParams,
+    #[nested(id_prefix = "flying", group = "Flying")]
+    pub flying: SliceParams,
+    #[nested(id_prefix = "ghost", group = "Ghost")]
+    pub ghost: SliceParams,
+    #[nested(id_prefix = "grass", group = "Grass")]
+    pub grass: SliceParams,
+    #[nested(id_prefix = "ground", group = "Ground")]
+    pub ground: SliceParams,
+    #[nested(id_prefix = "ice", group = "Ice")]
+    pub ice: SliceParams,
+    #[nested(id_prefix = "normal", group = "Normal")]
+    pub normal: SliceParams,
+    #[nested(id_prefix = "poison", group = "Poison")]
+    pub poison: SliceParams,
+    #[nested(id_prefix = "psychic", group = "Psychic")]
+    pub psychic: SliceParams,
+    #[nested(id_prefix = "rock", group = "Rock")]
+    pub rock: SliceParams,
+    #[nested(id_prefix = "steel", group = "Steel")]
+    pub steel: SliceParams,
+    #[nested(id_prefix = "water", group = "Water")]
+    pub water: SliceParams,
+    #[nested(id_prefix = "sage", group = "Sage")]
+    pub sage: SliceParams,
+    #[nested(id_prefix = "clay", group = "Clay")]
+    pub clay: SliceParams,
 }
 
 impl HyperchromaParams {
-    pub fn sample_toggle(&self, name: &str) -> Option<&BoolParam> {
+    pub fn slice(&self, name: &str) -> Option<&SliceParams> {
         Some(match name {
-            "bug" => &self.en_bug,
-            "dark" => &self.en_dark,
-            "dragon" => &self.en_dragon,
-            "electric" => &self.en_electric,
-            "fairy" => &self.en_fairy,
-            "fighting" => &self.en_fighting,
-            "fire" => &self.en_fire,
-            "flying" => &self.en_flying,
-            "ghost" => &self.en_ghost,
-            "grass" => &self.en_grass,
-            "ground" => &self.en_ground,
-            "ice" => &self.en_ice,
-            "normal" => &self.en_normal,
-            "poison" => &self.en_poison,
-            "psychic" => &self.en_psychic,
-            "rock" => &self.en_rock,
-            "steel" => &self.en_steel,
-            "water" => &self.en_water,
+            "bug" => &self.bug,
+            "dark" => &self.dark,
+            "dragon" => &self.dragon,
+            "electric" => &self.electric,
+            "fairy" => &self.fairy,
+            "fighting" => &self.fighting,
+            "fire" => &self.fire,
+            "flying" => &self.flying,
+            "ghost" => &self.ghost,
+            "grass" => &self.grass,
+            "ground" => &self.ground,
+            "ice" => &self.ice,
+            "normal" => &self.normal,
+            "poison" => &self.poison,
+            "psychic" => &self.psychic,
+            "rock" => &self.rock,
+            "steel" => &self.steel,
+            "water" => &self.water,
+            "sage" => &self.sage,
+            "clay" => &self.clay,
             _ => return None,
         })
-    }
-
-    /// Known recordings follow their mute toggle. Anything else stays in the draw.
-    pub fn is_enabled(&self, name: &str) -> bool {
-        self.sample_toggle(name)
-            .map(|param| param.value())
-            .unwrap_or(true)
     }
 }
 
 impl Default for Hyperchroma {
     fn default() -> Self {
-        let (tx, rx) = rtrb::RingBuffer::new(128);
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.subsec_nanos())
@@ -165,11 +292,11 @@ impl Default for Hyperchroma {
             params: Arc::new(HyperchromaParams::default()),
             engine: Engine::new(44_100.0, bank::Bank::empty(), seed),
             shared: Arc::new(SharedUi::default()),
-            ui_rx: rx,
-            ui_tx: Arc::new(Mutex::new(tx)),
             samples_loaded: false,
             meter: 0.0,
             peak_decay: 0.999,
+            preview_left: 0,
+            preview_on: false,
         }
     }
 }
@@ -177,7 +304,7 @@ impl Default for Hyperchroma {
 impl Default for HyperchromaParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(1040, 780),
+            editor_state: EguiState::from_size(1100, 900),
             gain: FloatParam::new(
                 "Gain",
                 -6.0,
@@ -211,7 +338,7 @@ impl Default for HyperchromaParams {
             )
             .with_step_size(1.0)
             .with_unit(" ms"),
-            root: IntParam::new("Original pitch", 60, IntRange::Linear { min: 0, max: 127 })
+            root: IntParam::new("Transpose", 60, IntRange::Linear { min: 0, max: 127 })
                 .with_value_to_string(Arc::new(|value| note_name(value)))
                 .with_string_to_value(Arc::new(|text| parse_note(text))),
             keytrack: BoolParam::new("Keytracking", false),
@@ -236,24 +363,31 @@ impl Default for HyperchromaParams {
             .with_step_size(0.1)
             .with_unit(" BPM"),
             sync: BoolParam::new("Follow host tempo", true),
-            en_bug: BoolParam::new("Bug", true),
-            en_dark: BoolParam::new("Dark", true),
-            en_dragon: BoolParam::new("Dragon", true),
-            en_electric: BoolParam::new("Electric", true),
-            en_fairy: BoolParam::new("Fairy", true),
-            en_fighting: BoolParam::new("Fighting", true),
-            en_fire: BoolParam::new("Fire", true),
-            en_flying: BoolParam::new("Flying", true),
-            en_ghost: BoolParam::new("Ghost", true),
-            en_grass: BoolParam::new("Grass", true),
-            en_ground: BoolParam::new("Ground", true),
-            en_ice: BoolParam::new("Ice", true),
-            en_normal: BoolParam::new("Normal", true),
-            en_poison: BoolParam::new("Poison", true),
-            en_psychic: BoolParam::new("Psychic", true),
-            en_rock: BoolParam::new("Rock", true),
-            en_steel: BoolParam::new("Steel", true),
-            en_water: BoolParam::new("Water", true),
+            swell: percent_param("Swell", 0.0),
+            crush: percent_param("Crush", 0.0),
+            pass: percent_param("Pass", 0.0),
+            stutter: percent_param("Stutter", 0.0),
+            smear: percent_param("Smear", 0.0),
+            bug: SliceParams::new(),
+            dark: SliceParams::new(),
+            dragon: SliceParams::new(),
+            electric: SliceParams::new(),
+            fairy: SliceParams::new(),
+            fighting: SliceParams::new(),
+            fire: SliceParams::new(),
+            flying: SliceParams::new(),
+            ghost: SliceParams::new(),
+            grass: SliceParams::new(),
+            ground: SliceParams::new(),
+            ice: SliceParams::new(),
+            normal: SliceParams::new(),
+            poison: SliceParams::new(),
+            psychic: SliceParams::new(),
+            rock: SliceParams::new(),
+            steel: SliceParams::new(),
+            water: SliceParams::new(),
+            sage: SliceParams::new(),
+            clay: SliceParams::new(),
         }
     }
 }
@@ -284,11 +418,10 @@ impl Plugin for Hyperchroma {
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let shared = self.shared.clone();
-        let tx = self.ui_tx.clone();
         let egui_state = params.editor_state.clone();
         create_egui_editor(
             egui_state.clone(),
-            KbState::new(tx),
+            KbState::new(),
             |ctx, _| editor::theme(ctx),
             move |ctx, setter, kb| {
                 editor::draw(ctx, setter, kb, &params, &shared, egui_state.as_ref());
@@ -320,10 +453,16 @@ impl Plugin for Hyperchroma {
 
     fn reset(&mut self) {
         self.engine.silence();
+        self.preview_on = false;
+        self.preview_left = 0;
+        self.shared.preview_slot.store(u32::MAX, Ordering::Relaxed);
         self.meter = 0.0;
         self.shared.voices.store(0, Ordering::Relaxed);
         self.shared.active_mask.store(0, Ordering::Relaxed);
         self.shared.peak_bits.store(0, Ordering::Relaxed);
+        for slot in &self.shared.playhead_ppm {
+            slot.store(u32::MAX, Ordering::Relaxed);
+        }
     }
 
     fn process(
@@ -342,14 +481,6 @@ impl Plugin for Hyperchroma {
             _ => self.shared.host_bpm_x100.store(0, Ordering::Relaxed),
         }
 
-        loop {
-            match self.ui_rx.pop() {
-                Ok(UiMidi::On { note, velocity }) => self.begin_note(0, note, velocity, None),
-                Ok(UiMidi::Off { note }) => self.end_note(0, note, None),
-                Err(_) => break,
-            }
-        }
-
         let mut next_event = context.next_event();
         let root = self.params.root.value();
         let keytrack = self.params.keytrack.value();
@@ -365,6 +496,15 @@ impl Plugin for Hyperchroma {
             manual
         };
         let tempo_ratio = (target / sample_bpm).clamp(0.05, 8.0);
+        self.engine.set_clock(target);
+        self.engine.set_global(GlobalRoll {
+            swell: self.params.swell.value(),
+            crush: self.params.crush.value(),
+            pass: self.params.pass.value(),
+            stutter: self.params.stutter.value(),
+            smear: self.params.smear.value(),
+        });
+        self.poll_preview(buffer.samples());
 
         for (sample_id, channel_samples) in buffer.iter_samples().enumerate() {
             while let Some(event) = next_event {
@@ -378,7 +518,9 @@ impl Plugin for Hyperchroma {
                         velocity,
                         voice_id,
                         ..
-                    } => self.begin_note(channel, note, velocity, voice_id),
+                    } => {
+                        self.begin_note(channel, note, velocity, voice_id, None);
+                    }
                     NoteEvent::NoteOff {
                         channel,
                         note,
@@ -429,6 +571,12 @@ impl Plugin for Hyperchroma {
         self.shared
             .active_mask
             .store(self.engine.active_mask(), Ordering::Relaxed);
+        let mut heads = [u32::MAX; SAMPLE_SLOTS];
+        let mut serials = [0u32; SAMPLE_SLOTS];
+        self.engine.write_playheads(&mut heads, &mut serials);
+        for (slot, head) in self.shared.playhead_ppm.iter().zip(heads) {
+            slot.store(head, Ordering::Relaxed);
+        }
 
         if self.engine.any_active() || self.params.editor_state.is_open() {
             ProcessStatus::KeepAlive
@@ -439,18 +587,91 @@ impl Plugin for Hyperchroma {
 }
 
 impl Hyperchroma {
-    fn begin_note(&mut self, channel: u8, note: u8, velocity: f32, voice_id: Option<i32>) {
-        if !(0..128).contains(&note) {
+    /// How long the editor's play button holds a note before releasing it.
+    const PREVIEW_SECONDS: f32 = 2.0;
+    const PREVIEW_VOICE: i32 = -1_000_001;
+    const PREVIEW_NOTE: u8 = 60;
+
+    fn poll_preview(&mut self, block_samples: usize) {
+        let requested = self.shared.preview_slot.swap(u32::MAX, Ordering::AcqRel);
+        if requested != u32::MAX {
+            self.stop_preview();
+            self.start_preview(requested as usize);
             return;
+        }
+        if !self.preview_on {
+            return;
+        }
+        let block = block_samples as u32;
+        if self.preview_left <= block {
+            self.stop_preview();
+        } else {
+            self.preview_left -= block;
+        }
+    }
+
+    fn start_preview(&mut self, slot: usize) {
+        let started = self.begin_note(
+            0,
+            Self::PREVIEW_NOTE,
+            1.0,
+            Some(Self::PREVIEW_VOICE),
+            Some(slot),
+        );
+        if !started {
+            return;
+        }
+        self.preview_on = true;
+        self.preview_left = (self.engine.sample_rate() * Self::PREVIEW_SECONDS)
+            .round()
+            .max(1.0) as u32;
+    }
+
+    fn stop_preview(&mut self) {
+        if !self.preview_on {
+            return;
+        }
+        let release = ms_to_samples(self.params.release.value(), self.engine.sample_rate());
+        self.engine.release_id(Self::PREVIEW_VOICE, release);
+        self.preview_on = false;
+        self.preview_left = 0;
+    }
+
+    fn begin_note(
+        &mut self,
+        channel: u8,
+        note: u8,
+        velocity: f32,
+        voice_id: Option<i32>,
+        forced: Option<usize>,
+    ) -> bool {
+        if !(0..128).contains(&note) {
+            return false;
         }
         if velocity <= 0.0 {
             self.end_note(channel, note, voice_id);
-            return;
+            return false;
         }
-        let mut enabled = [false; 32];
+        let mut weights = [0.0f32; 32];
+        let mut rolls = [SliceRolls::neutral(); 32];
         let count = self.engine.bank_len().min(32);
         for index in 0..count {
-            enabled[index] = self.params.is_enabled(self.engine.sample_name(index));
+            match self.params.slice(self.engine.sample_name(index)) {
+                Some(slice) => {
+                    weights[index] = slice.probability.value().clamp(0.0, 1.0);
+                    rolls[index] = SliceRolls {
+                        reverse: slice.reverse.value(),
+                        pan: slice.pan.value(),
+                        octave: slice.octave.value(),
+                    };
+                }
+                None => weights[index] = 1.0,
+            }
+        }
+        if let Some(slot) = forced {
+            if slot < weights.len() {
+                weights[slot] = 1.0;
+            }
         }
         let attack = ms_to_samples(self.params.attack.value(), self.engine.sample_rate());
         if let Some(triggered) = self.engine.note_on(
@@ -459,10 +680,11 @@ impl Hyperchroma {
                 velocity,
                 channel,
                 voice_id,
-                sample: None,
+                sample: forced,
                 start_norm: None,
             },
-            &enabled,
+            &weights,
+            &rolls,
             attack,
         ) {
             self.shared
@@ -470,6 +692,9 @@ impl Hyperchroma {
                 .store(triggered.sample as u32, Ordering::Relaxed);
             let ppm = (triggered.start_norm.clamp(0.0, 1.0) * 1000.0).round() as u32;
             self.shared.last_ppm.store(ppm.min(1000), Ordering::Relaxed);
+            true
+        } else {
+            false
         }
     }
 
