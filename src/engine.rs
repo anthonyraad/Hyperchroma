@@ -3,7 +3,10 @@ use crate::bank::Bank;
 const MAX_VOICES: usize = 16;
 const MAX_GRAINS: usize = 3;
 const SMEAR_GRAINS: usize = 6;
+const SPLATTER_GRAINS: usize = 4;
 const MAX_SAMPLES: usize = 32;
+const ESCAPE_COMBS: usize = 4;
+const ESCAPE_REGIONS: usize = 8;
 
 /// What the plugin asks the engine to do when a note starts.
 pub struct NoteOn {
@@ -68,10 +71,16 @@ pub struct GlobalRoll {
     pub crush: f32,
     /// Chance the note is randomly low-passed or high-passed.
     pub pass: f32,
-    /// Chance the note stutters on a random clock division.
+    /// Chance the note repeats its last division as a roll.
     pub stutter: f32,
     /// Chance the note's slices scatter around the playhead.
     pub smear: f32,
+    /// Chance the note gains a patter of short, soft grains.
+    pub splatter: f32,
+    /// Chance the note is set into a short, distant reverb.
+    pub escape: f32,
+    /// Chance the note eases toward the other knobs, or from them back to dry.
+    pub drift: f32,
 }
 
 impl GlobalRoll {
@@ -82,6 +91,9 @@ impl GlobalRoll {
             pass: 0.0,
             stutter: 0.0,
             smear: 0.0,
+            splatter: 0.0,
+            escape: 0.0,
+            drift: 0.0,
         }
     }
 }
@@ -96,6 +108,9 @@ pub struct SliceRolls {
     pub pan: f32,
     /// Chance, `0..1`, that this note plays an octave higher.
     pub octave: f32,
+    /// How this recording meets the global effects. `0.5` leaves them as set.
+    /// `0` is immune. `1` catches at least one effect that is turned up.
+    pub charm: f32,
 }
 
 impl SliceRolls {
@@ -104,6 +119,7 @@ impl SliceRolls {
             reverse: 0.0,
             pan: 0.0,
             octave: 0.0,
+            charm: 0.5,
         }
     }
 }
@@ -139,6 +155,8 @@ struct Voice {
     pass_l: f32,
     pass_r: f32,
     stutter: StutterDiv,
+    /// Captured roll length in output samples. `0` when the note is not repeating.
+    stutter_len: u32,
     stutter_pos: u32,
     smear: bool,
     /// Scatter radius in recording frames.
@@ -154,6 +172,61 @@ struct Voice {
     smear_voices: u8,
     smear_wait: usize,
     smear_grains: [Grain; SMEAR_GRAINS],
+    splatter: bool,
+    /// Scatter radius in recording frames.
+    splatter_radius: f64,
+    /// Center grain length in output samples.
+    splatter_len: usize,
+    splatter_lo: f32,
+    splatter_hi: f32,
+    splatter_detune: f32,
+    splatter_glint: f32,
+    splatter_width: f32,
+    splatter_gain: f32,
+    splatter_gap_min: usize,
+    splatter_gap_max: usize,
+    splatter_voices: u8,
+    splatter_wait: usize,
+    /// Opening taps still due to land closer together.
+    splatter_burst: u8,
+    /// Soft rise of each tap, in output samples.
+    splatter_attack: usize,
+    splatter_grains: [Grain; SPLATTER_GRAINS],
+    drift: bool,
+    drift_from_center: bool,
+    drift_pos: u32,
+    drift_len: u32,
+    /// Eased position of the current drift, `0` dry and `1` at the destinations.
+    drift_now: f32,
+    dest_swell: f32,
+    dest_crush: f32,
+    dest_pass: f32,
+    dest_stutter: f32,
+    dest_smear: f32,
+    dest_splatter: f32,
+    dest_escape: f32,
+    crush_target_steps: f32,
+    crush_target_len: u32,
+    pass_hz: f32,
+    escape: bool,
+    escape_wet: f32,
+    escape_dry: f32,
+    escape_fb: [f32; ESCAPE_COMBS],
+    escape_damp: [f32; ESCAPE_COMBS],
+    escape_damp_coeff: f32,
+    escape_comb_len: [usize; ESCAPE_COMBS],
+    escape_comb_pos: [usize; ESCAPE_COMBS],
+    escape_pre_len: usize,
+    escape_pre_pos: usize,
+    escape_ap_len: [usize; 2],
+    escape_ap_pos: [usize; 2],
+    escape_ap_fb: f32,
+    escape_side_len: usize,
+    escape_side_pos: usize,
+    escape_lp: f32,
+    escape_lp_coeff: f32,
+    /// Output frames to keep the voice alive after the envelope, so the wash can finish.
+    escape_tail: u32,
 }
 
 impl Voice {
@@ -188,6 +261,7 @@ impl Voice {
             pass_l: 0.0,
             pass_r: 0.0,
             stutter: StutterDiv::Off,
+            stutter_len: 0,
             stutter_pos: 0,
             smear: false,
             smear_radius: 0.0,
@@ -201,6 +275,55 @@ impl Voice {
             smear_voices: 0,
             smear_wait: 0,
             smear_grains: [Grain::off(); SMEAR_GRAINS],
+            splatter: false,
+            splatter_radius: 0.0,
+            splatter_len: 0,
+            splatter_lo: 1.0,
+            splatter_hi: 1.0,
+            splatter_detune: 0.0,
+            splatter_glint: 0.0,
+            splatter_width: 0.0,
+            splatter_gain: 0.0,
+            splatter_gap_min: 1,
+            splatter_gap_max: 1,
+            splatter_voices: 0,
+            splatter_wait: 0,
+            splatter_burst: 0,
+            splatter_attack: 1,
+            splatter_grains: [Grain::off(); SPLATTER_GRAINS],
+            drift: false,
+            drift_from_center: true,
+            drift_pos: 0,
+            drift_len: 0,
+            drift_now: 1.0,
+            dest_swell: 0.0,
+            dest_crush: 0.0,
+            dest_pass: 0.0,
+            dest_stutter: 0.0,
+            dest_smear: 0.0,
+            dest_splatter: 0.0,
+            dest_escape: 0.0,
+            crush_target_steps: 32.0,
+            crush_target_len: 1,
+            pass_hz: 0.0,
+            escape: false,
+            escape_wet: 0.0,
+            escape_dry: 1.0,
+            escape_fb: [0.0; ESCAPE_COMBS],
+            escape_damp: [0.0; ESCAPE_COMBS],
+            escape_damp_coeff: 0.0,
+            escape_comb_len: [1; ESCAPE_COMBS],
+            escape_comb_pos: [0; ESCAPE_COMBS],
+            escape_pre_len: 1,
+            escape_pre_pos: 0,
+            escape_ap_len: [1; 2],
+            escape_ap_pos: [0; 2],
+            escape_ap_fb: 0.0,
+            escape_side_len: 1,
+            escape_side_pos: 0,
+            escape_lp: 0.0,
+            escape_lp_coeff: 1.0,
+            escape_tail: 0,
         }
     }
 }
@@ -210,6 +333,18 @@ enum PassMode {
     Off,
     Low,
     High,
+}
+
+#[derive(Clone, Copy)]
+enum Weather {
+    Swell,
+    Crush,
+    Pass,
+    Stutter,
+    Smear,
+    Splatter,
+    Escape,
+    Drift,
 }
 
 /// A clock division, measured in quarter-note beats.
@@ -263,6 +398,17 @@ pub struct Engine {
     /// Remaining smear degrees, dealt in a shuffled order.
     smear_bag: [SmearDegree; 3],
     smear_left: u8,
+    splatter_bag: [SplatterDegree; 3],
+    splatter_left: u8,
+    escape_bag: [EscapeDegree; 3],
+    escape_left: u8,
+    /// One captured roll per voice, laid out as `voice * stutter_cap`.
+    stutter_l: Vec<f32>,
+    stutter_r: Vec<f32>,
+    stutter_cap: usize,
+    /// Delay lines for Escape, `voice * ESCAPE_REGIONS * escape_region`.
+    escape_buf: Vec<f32>,
+    escape_region: usize,
 }
 
 impl Engine {
@@ -282,6 +428,19 @@ impl Engine {
             crush_left: 0,
             smear_bag: [SmearDegree::Little, SmearDegree::Moderate, SmearDegree::Lot],
             smear_left: 0,
+            splatter_bag: [
+                SplatterDegree::Little,
+                SplatterDegree::Moderate,
+                SplatterDegree::Lot,
+            ],
+            splatter_left: 0,
+            escape_bag: [EscapeDegree::Little, EscapeDegree::Moderate, EscapeDegree::Lot],
+            escape_left: 0,
+            stutter_l: Vec::new(),
+            stutter_r: Vec::new(),
+            stutter_cap: 0,
+            escape_buf: Vec::new(),
+            escape_region: 1,
         };
         engine.set_sample_rate(sample_rate);
         engine
@@ -305,6 +464,16 @@ impl Engine {
                 0.5 * (1.0 - (std::f32::consts::TAU * phase).cos())
             })
             .collect();
+        self.stutter_cap = stutter_cap_for(sample_rate);
+        let cells = self.stutter_cap.saturating_mul(MAX_VOICES);
+        self.stutter_l = vec![0.0; cells];
+        self.stutter_r = vec![0.0; cells];
+        self.escape_region = escape_region_for(sample_rate);
+        let escape_cells = self
+            .escape_region
+            .saturating_mul(ESCAPE_REGIONS)
+            .saturating_mul(MAX_VOICES);
+        self.escape_buf = vec![0.0; escape_cells];
         self.silence();
     }
 
@@ -377,29 +546,252 @@ impl Engine {
         let mut reverse = self.rng.unit() < roll.reverse.clamp(0.0, 1.0);
         let pan = rolled_pan(&mut self.rng, roll.pan);
         let octave_up = self.rng.unit() < roll.octave.clamp(0.0, 1.0);
-        let swell = fired(&mut self.rng, self.global.swell);
-        if swell {
+        let charm = if roll.charm.is_finite() {
+            roll.charm.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let damp = if charm < 0.5 { charm / 0.5 } else { 1.0 };
+        let chance = |value: f32| value * damp;
+        let mut drift = fired(&mut self.rng, chance(self.global.drift));
+        let mut drift_from_center = true;
+        let mut drift_len = 0u32;
+        if drift {
+            drift_from_center = self.rng.unit() < 0.5;
+            let seconds = 2.15 + self.rng.unit() * 1.35;
+            drift_len = (self.sample_rate * seconds).round().max(8.0) as u32;
+        }
+        let knob = |value: f32| value.clamp(0.0, 1.0);
+        let mut swell = if drift {
+            false
+        } else {
+            fired(&mut self.rng, chance(self.global.swell))
+        };
+        let mut dest_swell = if drift {
+            knob(self.global.swell)
+        } else if swell {
+            1.0
+        } else {
+            0.0
+        };
+        if drift && dest_swell > 0.2 {
+            reverse = true;
+        } else if swell {
             reverse = true;
         }
-        let crush = fired(&mut self.rng, self.global.crush);
-        let (crush_steps, crush_len) = if crush {
+        let mut crush_on = if drift {
+            knob(self.global.crush) > 0.001
+        } else {
+            fired(&mut self.rng, chance(self.global.crush))
+        };
+        let (mut crush_steps, mut crush_len) = if crush_on {
             crush_setup(self.take_crush(), self.sample_rate)
         } else {
             (32.0, 1)
         };
-        let (pass, pass_coeff) = self.roll_pass();
-        let stutter = self.roll_stutter();
-        let smear = fired(&mut self.rng, self.global.smear);
-        let smear_tone = if smear {
+        let mut dest_crush = if drift {
+            knob(self.global.crush)
+        } else if crush_on {
+            1.0
+        } else {
+            0.0
+        };
+        let (mut pass, mut pass_hz, mut pass_coeff) = if drift {
+            if knob(self.global.pass) > 0.001 {
+                let (mode, hz) = self.pick_pass();
+                let opened = if drift_from_center {
+                    0.0
+                } else {
+                    knob(self.global.pass)
+                };
+                let hz_now = drifted_hz(mode, hz, opened);
+                (mode, hz, cutoff_coeff(self.sample_rate, hz_now))
+            } else {
+                (PassMode::Off, 0.0, 0.0)
+            }
+        } else {
+            let (mode, coeff) = self.roll_pass(chance(self.global.pass));
+            (mode, 0.0, coeff)
+        };
+        let mut dest_pass = if drift {
+            knob(self.global.pass)
+        } else if pass != PassMode::Off {
+            1.0
+        } else {
+            0.0
+        };
+        let mut stutter = if drift {
+            if knob(self.global.stutter) > 0.001 {
+                self.pick_stutter()
+            } else {
+                StutterDiv::Off
+            }
+        } else {
+            self.roll_stutter(chance(self.global.stutter))
+        };
+        let mut dest_stutter = if drift {
+            knob(self.global.stutter)
+        } else if stutter != StutterDiv::Off {
+            1.0
+        } else {
+            0.0
+        };
+        let smear = if drift {
+            knob(self.global.smear) > 0.001
+        } else {
+            fired(&mut self.rng, chance(self.global.smear))
+        };
+        let mut smear_tone = if smear {
             Some(smear_setup(self.take_smear()))
         } else {
             None
         };
-        let attack_samples = if swell {
-            attack_samples.max(self.sample_rate * SWELL_SECONDS)
+        let mut dest_smear = if drift {
+            knob(self.global.smear)
+        } else if smear {
+            1.0
         } else {
-            attack_samples
+            0.0
         };
+        let splatter = if drift {
+            knob(self.global.splatter) > 0.001
+        } else {
+            fired(&mut self.rng, chance(self.global.splatter))
+        };
+        let mut splatter_tone = if splatter {
+            Some(splatter_setup(self.take_splatter()))
+        } else {
+            None
+        };
+        let mut dest_splatter = if drift {
+            knob(self.global.splatter)
+        } else if splatter {
+            1.0
+        } else {
+            0.0
+        };
+        let mut escape = if drift {
+            knob(self.global.escape) > 0.001
+        } else {
+            fired(&mut self.rng, chance(self.global.escape))
+        };
+        let mut escape_tone = if escape {
+            Some(escape_setup(self.take_escape()))
+        } else {
+            None
+        };
+        let mut dest_escape = if drift {
+            knob(self.global.escape)
+        } else if escape {
+            1.0
+        } else {
+            0.0
+        };
+        let caught = swell
+            || crush_on
+            || pass != PassMode::Off
+            || stutter != StutterDiv::Off
+            || smear
+            || splatter
+            || escape
+            || (drift
+                && (self.global.swell > 0.001
+                    || self.global.crush > 0.001
+                    || self.global.pass > 0.001
+                    || self.global.stutter > 0.001
+                    || self.global.smear > 0.001
+                    || self.global.splatter > 0.001
+                    || self.global.escape > 0.001));
+        if charm > 0.5 && !caught {
+            if let Some(kind) = self.charm_catch(charm) {
+                match kind {
+                    Weather::Swell => {
+                        swell = true;
+                        reverse = true;
+                        dest_swell = 1.0;
+                    }
+                    Weather::Crush => {
+                        crush_on = true;
+                        let (steps, hold) = crush_setup(self.take_crush(), self.sample_rate);
+                        crush_steps = steps;
+                        crush_len = hold;
+                        dest_crush = 1.0;
+                    }
+                    Weather::Pass => {
+                        let (mode, hz) = self.pick_pass();
+                        pass = mode;
+                        pass_hz = hz;
+                        pass_coeff = cutoff_coeff(self.sample_rate, hz);
+                        dest_pass = 1.0;
+                    }
+                    Weather::Stutter => {
+                        stutter = self.pick_stutter();
+                        dest_stutter = 1.0;
+                    }
+                    Weather::Smear => {
+                        smear_tone = Some(smear_setup(self.take_smear()));
+                        dest_smear = 1.0;
+                    }
+                    Weather::Splatter => {
+                        splatter_tone = Some(splatter_setup(self.take_splatter()));
+                        dest_splatter = 1.0;
+                    }
+                    Weather::Escape => {
+                        escape = true;
+                        escape_tone = Some(escape_setup(self.take_escape()));
+                        dest_escape = 1.0;
+                    }
+                    Weather::Drift => {
+                        drift = true;
+                        drift_from_center = self.rng.unit() < 0.5;
+                        let seconds = 2.15 + self.rng.unit() * 1.35;
+                        drift_len = (self.sample_rate * seconds).round().max(8.0) as u32;
+                        dest_swell = knob(self.global.swell);
+                        dest_crush = knob(self.global.crush);
+                        dest_pass = knob(self.global.pass);
+                        dest_stutter = knob(self.global.stutter);
+                        dest_smear = knob(self.global.smear);
+                        dest_splatter = knob(self.global.splatter);
+                        dest_escape = knob(self.global.escape);
+                        if dest_swell > 0.2 {
+                            reverse = true;
+                        }
+                        if dest_crush > 0.001 {
+                            crush_on = true;
+                            let (steps, hold) = crush_setup(self.take_crush(), self.sample_rate);
+                            crush_steps = steps;
+                            crush_len = hold;
+                        }
+                        if dest_pass > 0.001 {
+                            let (mode, hz) = self.pick_pass();
+                            let opened = if drift_from_center { 0.0 } else { dest_pass };
+                            pass = mode;
+                            pass_hz = hz;
+                            pass_coeff = cutoff_coeff(self.sample_rate, drifted_hz(mode, hz, opened));
+                        }
+                        if dest_stutter > 0.001 {
+                            stutter = self.pick_stutter();
+                        }
+                        if dest_smear > 0.001 {
+                            smear_tone = Some(smear_setup(self.take_smear()));
+                        }
+                        if dest_splatter > 0.001 {
+                            splatter_tone = Some(splatter_setup(self.take_splatter()));
+                        }
+                        if dest_escape > 0.001 {
+                            escape = true;
+                            escape_tone = Some(escape_setup(self.take_escape()));
+                        }
+                    }
+                }
+            }
+        }
+        let mut attack_samples = attack_samples;
+        if drift && drift_from_center && dest_swell > 0.2 {
+            attack_samples = attack_samples.max(self.sample_rate * SWELL_SECONDS * dest_swell);
+        } else if swell {
+            attack_samples = attack_samples.max(self.sample_rate * SWELL_SECONDS);
+        }
 
         let slot = self.allocate_voice();
         let serial = self.next_serial;
@@ -416,12 +808,29 @@ impl Engine {
         voice.reverse = reverse;
         voice.pan = pan;
         voice.octave_up = octave_up;
-        voice.crush = crush;
+        voice.crush = crush_on;
         voice.crush_steps = crush_steps;
         voice.crush_len = crush_len;
+        voice.crush_target_steps = crush_steps;
+        voice.crush_target_len = crush_len;
         voice.pass = pass;
+        voice.pass_hz = pass_hz;
         voice.pass_coeff = pass_coeff;
         voice.stutter = stutter;
+        voice.stutter_len = self.stutter_period(stutter);
+        voice.stutter_pos = 0;
+        voice.drift = drift;
+        voice.drift_from_center = drift_from_center;
+        voice.drift_pos = 0;
+        voice.drift_len = drift_len;
+        voice.drift_now = if drift && drift_from_center { 0.0 } else { 1.0 };
+        voice.dest_swell = dest_swell;
+        voice.dest_crush = dest_crush;
+        voice.dest_pass = dest_pass;
+        voice.dest_stutter = dest_stutter;
+        voice.dest_smear = dest_smear;
+        voice.dest_splatter = dest_splatter;
+        voice.dest_escape = dest_escape;
         if let Some(tone) = smear_tone {
             voice.smear = true;
             voice.smear_radius = tone.radius_secs * source_rate;
@@ -438,8 +847,35 @@ impl Engine {
             voice.smear_gap_min = gap_min as usize;
             voice.smear_gap_max = gap_max as usize;
         }
+        if let Some(tone) = splatter_tone {
+            voice.splatter = true;
+            voice.splatter_radius = tone.radius_secs * source_rate;
+            voice.splatter_len = (self.sample_rate as f64 * tone.grain_secs)
+                .round()
+                .max(2.0) as usize;
+            voice.splatter_lo = tone.grain_lo;
+            voice.splatter_hi = tone.grain_hi;
+            voice.splatter_detune = tone.detune;
+            voice.splatter_glint = tone.glint;
+            voice.splatter_width = tone.width;
+            voice.splatter_gain = tone.gain;
+            voice.splatter_voices = tone.voices;
+            voice.splatter_attack = (self.sample_rate as f64 * 0.003).round().max(1.0) as usize;
+            voice.splatter_burst = 3;
+            voice.splatter_wait = 0;
+            let gap_min = (self.sample_rate as f64 * tone.gap_min).round().max(1.0);
+            let gap_max = (self.sample_rate as f64 * tone.gap_max).round().max(gap_min);
+            voice.splatter_gap_min = gap_min as usize;
+            voice.splatter_gap_max = gap_max as usize;
+        }
+        if let Some(tone) = escape_tone {
+            self.arm_escape(&mut voice, &tone);
+        }
         set_env(&mut voice, velocity, attack_samples);
         self.voices[slot] = voice;
+        if escape {
+            self.clear_escape(slot);
+        }
 
         Some(Triggered {
             sample: sample_index,
@@ -694,15 +1130,19 @@ impl Engine {
             pitch *= 2.0;
         }
         let read_inc = pitch as f64 * sr_ratio * direction;
+        // A leap keeps the playhead with the doubled read, so the slices overlap
+        // on the waveform. Leaving the playhead at the tempo puts each new slice
+        // about 40 ms away from the one already sounding, and that overlap combs.
+        let schedule = if octave_up { pitch } else { tempo_ratio };
 
-        if self.voices[index].smear {
+        if self.voices[index].smear && !self.voices[index].drift {
             return self.render_smear(
                 index,
                 sample_index,
                 frames as f64,
                 read_inc,
                 playhead,
-                tempo_ratio,
+                schedule,
                 sr_ratio,
                 direction,
                 pan,
@@ -719,7 +1159,7 @@ impl Engine {
             // Those only land on the same waveform when the two rates match. Anywhere
             // else, the next slice has to be slid onto the one already playing or the
             // overlap combs and the recording sounds warped.
-            let origin = if (pitch - tempo_ratio).abs() <= 0.000_8 {
+            let origin = if (pitch - schedule).abs() <= 0.000_8 {
                 playhead
             } else {
                 let previous = grains
@@ -738,7 +1178,7 @@ impl Engine {
                 slot.age = 0;
                 slot.origin = origin;
             }
-            let advance = hop as f64 * tempo_ratio as f64 * sr_ratio * direction;
+            let advance = hop as f64 * schedule as f64 * sr_ratio * direction;
             playhead = (playhead + advance).rem_euclid(frames as f64);
             until_next = hop;
         }
@@ -763,11 +1203,16 @@ impl Engine {
         self.voices[index].grains = grains;
         self.voices[index].playhead = playhead;
         self.voices[index].until_next = until_next;
-        let (left, right) = place(left, right, pan);
-        let (left, right) = self.color_voice(index, left, right);
-        let env = self.voices[index].env;
-        let gate = self.stutter_gate(index);
-        (left * env * gate, right * env * gate)
+        self.apply_drift(index);
+        let smear_amount = effect_amount(&self.voices[index], self.voices[index].dest_smear);
+        if smear_amount > 0.001 {
+            let (cloud_l, cloud_r) =
+                self.smear_sum(index, sample_index, frames as f64, read_inc, playhead);
+            left = left * (1.0 - smear_amount) + cloud_l * smear_amount;
+            right = right * (1.0 - smear_amount) + cloud_r * smear_amount;
+        }
+        let (left, right) = self.mix_splatter(index, sample_index, frames as f64, read_inc, playhead, left, right);
+        self.finish_voice(index, left, right, pan)
     }
 
     /// A slow cloud of blooming slices. They do not share a clock, so the note
@@ -779,12 +1224,28 @@ impl Engine {
         frames: f64,
         read_inc: f64,
         mut playhead: f64,
-        tempo_ratio: f32,
+        schedule: f32,
         sr_ratio: f64,
         direction: f64,
         pan: PanSide,
     ) -> (f32, f32) {
-        playhead = (playhead + tempo_ratio as f64 * sr_ratio * direction).rem_euclid(frames);
+        playhead = (playhead + schedule as f64 * sr_ratio * direction).rem_euclid(frames);
+        let (left, right) = self.smear_sum(index, sample_index, frames, read_inc, playhead);
+        self.voices[index].playhead = playhead;
+        self.apply_drift(index);
+        let (left, right) = self.mix_splatter(index, sample_index, frames, read_inc, playhead, left, right);
+        self.finish_voice(index, left, right, pan)
+    }
+
+    /// Scattered slices around `playhead`. Does not move the playhead.
+    fn smear_sum(
+        &mut self,
+        index: usize,
+        sample_index: usize,
+        frames: f64,
+        read_inc: f64,
+        playhead: f64,
+    ) -> (f32, f32) {
         let radius = self.voices[index].smear_radius;
         let center = self.voices[index].smear_len.max(2);
         let flip = self.voices[index].smear_flip;
@@ -858,32 +1319,211 @@ impl Engine {
 
         self.voices[index].smear_grains = grains;
         self.voices[index].smear_wait = wait;
-        self.voices[index].playhead = playhead;
-        let (left, right) = place(left, right, pan);
-        let (left, right) = self.color_voice(index, left, right);
-        let env = self.voices[index].env;
-        let gate = self.stutter_gate(index);
-        (left * env * gate, right * env * gate)
+        (left, right)
     }
 
-    fn roll_pass(&mut self) -> (PassMode, f32) {
-        if !fired(&mut self.rng, self.global.pass) {
+    /// The taps replace the note. Drift eases from the dry recording into the patter.
+    fn mix_splatter(
+        &mut self,
+        index: usize,
+        sample_index: usize,
+        frames: f64,
+        read_inc: f64,
+        playhead: f64,
+        left: f32,
+        right: f32,
+    ) -> (f32, f32) {
+        let amount = effect_amount(&self.voices[index], self.voices[index].dest_splatter);
+        if amount <= 0.001 {
+            return (left, right);
+        }
+        let (tap_l, tap_r) = self.splatter_sum(index, sample_index, frames, read_inc, playhead);
+        (
+            left * (1.0 - amount) + tap_l * amount,
+            right * (1.0 - amount) + tap_r * amount,
+        )
+    }
+
+    /// A sparse patter of short grains around the playhead.
+    fn splatter_sum(
+        &mut self,
+        index: usize,
+        sample_index: usize,
+        frames: f64,
+        read_inc: f64,
+        playhead: f64,
+    ) -> (f32, f32) {
+        let radius = self.voices[index].splatter_radius;
+        let center = self.voices[index].splatter_len.max(2);
+        let lo = self.voices[index].splatter_lo as f64;
+        let hi = self.voices[index].splatter_hi.max(self.voices[index].splatter_lo) as f64;
+        let detune = self.voices[index].splatter_detune;
+        let glint = self.voices[index].splatter_glint;
+        let width = self.voices[index].splatter_width;
+        let level = self.voices[index].splatter_gain;
+        let gap_min = self.voices[index].splatter_gap_min.max(1);
+        let gap_max = self.voices[index].splatter_gap_max.max(gap_min);
+        let max_voices = self.voices[index].splatter_voices.max(1) as usize;
+        let attack = self.voices[index].splatter_attack.max(1);
+        let mut grains = self.voices[index].splatter_grains;
+        let mut wait = self.voices[index].splatter_wait;
+        let mut burst = self.voices[index].splatter_burst;
+
+        for grain in &mut grains {
+            if grain.on && grain.age >= grain.len {
+                grain.on = false;
+            }
+        }
+        if wait == 0 {
+            let sounding = grains.iter().filter(|grain| grain.on).count();
+            if sounding < max_voices {
+                if let Some(slot) = grains.iter_mut().find(|grain| !grain.on) {
+                    let spread = self.rng.unit() as f64 * 2.0 - 1.0;
+                    let jitter = spread * radius;
+                    let cents = (self.rng.unit() * 2.0 - 1.0) * detune;
+                    let mut step_mul = 2.0_f64.powf(cents as f64 / 1_200.0);
+                    let gain = level * (0.9 + self.rng.unit() * 0.1);
+                    if self.rng.unit() < glint {
+                        let harmonic = if self.rng.unit() < 0.5 { 2.0 } else { 1.498_307 };
+                        step_mul *= harmonic;
+                    }
+                    let span = (center as f64 * (lo + self.rng.unit() as f64 * (hi - lo)))
+                        .round()
+                        .max(2.0) as usize;
+                    slot.on = true;
+                    slot.age = 0;
+                    slot.origin = (playhead + jitter).rem_euclid(frames);
+                    slot.smear = true;
+                    slot.step_mul = step_mul;
+                    slot.gain = gain;
+                    slot.len = span;
+                    slot.pan = (self.rng.unit() * 2.0 - 1.0) * width;
+                }
+            }
+            let pick = self.rng.unit();
+            let mut gap = gap_min + ((gap_max - gap_min) as f32 * pick).round() as usize;
+            if burst > 0 {
+                gap = ((gap as f32) * 0.45).round().max(1.0) as usize;
+                burst -= 1;
+            }
+            wait = gap.max(1);
+        } else {
+            wait -= 1;
+        }
+
+        let mut left = 0.0f32;
+        let mut right = 0.0f32;
+        for grain in &mut grains {
+            if !grain.on {
+                continue;
+            }
+            let limit = grain.len.max(1);
+            let age = grain.age.min(limit.saturating_sub(1));
+            let window = tick_window(age, limit, attack);
+            let position = grain.origin + grain.age as f64 * read_inc * grain.step_mul;
+            let (sample_l, sample_r) = self.bank.samples[sample_index].read(position);
+            let level = window * grain.gain;
+            let steer = grain.pan.clamp(-1.0, 1.0);
+            left += sample_l * level * (1.0 - steer.max(0.0));
+            right += sample_r * level * (1.0 + steer.min(0.0));
+            grain.age += 1;
+        }
+
+        self.voices[index].splatter_grains = grains;
+        self.voices[index].splatter_wait = wait;
+        self.voices[index].splatter_burst = burst;
+        (left, right)
+    }
+
+    fn finish_voice(&mut self, index: usize, left: f32, right: f32, pan: PanSide) -> (f32, f32) {
+        let (left, right) = place(left, right, pan);
+        let (left, right) = self.color_voice(index, left, right);
+        let stutter_amount = effect_amount(&self.voices[index], self.voices[index].dest_stutter);
+        let (left, right) = self.stutter_repeat(index, left, right, stutter_amount);
+        let voice = &self.voices[index];
+        let bloom = if voice.drift && voice.drift_from_center {
+            1.0 - voice.dest_swell.clamp(0.0, 1.0) * 0.72 * (1.0 - voice.drift_now)
+        } else {
+            1.0
+        };
+        let env = voice.env;
+        let (left, right) = (left * env * bloom, right * env * bloom);
+        self.escape_mix(index, left, right)
+    }
+
+    fn roll_pass(&mut self, chance: f32) -> (PassMode, f32) {
+        if !fired(&mut self.rng, chance) {
             return (PassMode::Off, 0.0);
         }
-        let low = self.rng.unit() < 0.5;
-        let degree = self.rng.unit();
-        let (mode, hz) = if low {
-            (PassMode::Low, 280.0 * (1_200.0_f32 / 280.0).powf(degree))
-        } else {
-            (PassMode::High, 800.0 * (2_400.0_f32 / 800.0).powf(degree))
-        };
+        let (mode, hz) = self.pick_pass();
         (mode, cutoff_coeff(self.sample_rate, hz))
     }
 
-    fn roll_stutter(&mut self) -> StutterDiv {
-        if !fired(&mut self.rng, self.global.stutter) {
+    fn pick_pass(&mut self) -> (PassMode, f32) {
+        let low = self.rng.unit() < 0.5;
+        let degree = self.rng.unit();
+        if low {
+            (PassMode::Low, 280.0 * (1_200.0_f32 / 280.0).powf(degree))
+        } else {
+            (
+                PassMode::High,
+                800.0 * (2_400.0_f32 / 800.0).powf(degree),
+            )
+        }
+    }
+
+    fn roll_stutter(&mut self, chance: f32) -> StutterDiv {
+        if !fired(&mut self.rng, chance) {
             return StutterDiv::Off;
         }
+        self.pick_stutter()
+    }
+
+    /// Above noon, a dry roll can still catch one enabled global effect.
+    /// The catch is weighted by how far each knob is turned up.
+    fn charm_catch(&mut self, charm: f32) -> Option<Weather> {
+        let lean = ((charm - 0.5) / 0.5).clamp(0.0, 1.0);
+        if lean <= 0.0 {
+            return None;
+        }
+        if lean < 1.0 && !fired(&mut self.rng, lean) {
+            return None;
+        }
+        let weights = [
+            (Weather::Swell, self.global.swell),
+            (Weather::Crush, self.global.crush),
+            (Weather::Pass, self.global.pass),
+            (Weather::Stutter, self.global.stutter),
+            (Weather::Smear, self.global.smear),
+            (Weather::Splatter, self.global.splatter),
+            (Weather::Escape, self.global.escape),
+            (Weather::Drift, self.global.drift),
+        ];
+        let total: f32 = weights
+            .iter()
+            .map(|(_, weight)| weight.max(0.0))
+            .filter(|weight| *weight > 0.001)
+            .sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let mut pick = self.rng.unit() * total;
+        let mut chosen = None;
+        for (kind, weight) in weights {
+            let weight = weight.max(0.0);
+            if weight <= 0.001 {
+                continue;
+            }
+            chosen = Some(kind);
+            pick -= weight;
+            if pick <= 0.0 {
+                return Some(kind);
+            }
+        }
+        chosen
+    }
+
+    fn pick_stutter(&mut self) -> StutterDiv {
         match (self.rng.unit() * 4.0).floor() as u32 {
             0 => StutterDiv::Eighth,
             1 => StutterDiv::Sixteenth,
@@ -921,27 +1561,201 @@ impl Engine {
         (left, right)
     }
 
-    fn stutter_gate(&mut self, index: usize) -> f32 {
-        let voice = &mut self.voices[index];
-        let beats = match voice.stutter {
-            StutterDiv::Off => return 1.0,
+    fn stutter_period(&self, div: StutterDiv) -> u32 {
+        let beats = match div {
+            StutterDiv::Off => return 0,
             StutterDiv::Eighth => 0.5,
             StutterDiv::Sixteenth => 0.25,
             StutterDiv::SixteenthTriplet => 1.0 / 6.0,
             StutterDiv::ThirtySecond => 0.125,
         };
-        let period = ((beats * 60.0 / self.clock_bpm) * self.sample_rate)
+        let cap = self.stutter_cap.max(2) as f32;
+        ((beats * 60.0 / self.clock_bpm) * self.sample_rate)
             .round()
-            .clamp(2.0, self.sample_rate * 4.0) as u32;
-        let pos = voice.stutter_pos % period;
-        voice.stutter_pos = voice.stutter_pos.wrapping_add(1);
-        let half = (period / 2).max(1);
-        if pos >= half {
-            return 0.0;
+            .clamp(2.0, cap) as u32
+    }
+
+    /// Capture one division, then blend the live note into that repeating slice.
+    /// `amount` is `1` for a full roll and `0` for the untouched note.
+    fn stutter_repeat(&mut self, index: usize, left: f32, right: f32, amount: f32) -> (f32, f32) {
+        let period = self.voices[index].stutter_len as usize;
+        if period < 2 || self.stutter_cap < period {
+            return (left, right);
         }
-        let fade = (period / 12).clamp(1, 96).min(half);
-        let edge = pos.min(half - pos) as f32 / fade as f32;
-        edge.clamp(0.0, 1.0)
+        let base = index * self.stutter_cap;
+        let pos = self.voices[index].stutter_pos as usize;
+        if pos < period {
+            self.stutter_l[base + pos] = left;
+            self.stutter_r[base + pos] = right;
+            self.voices[index].stutter_pos = (pos + 1) as u32;
+            return (left, right);
+        }
+        let cursor = (pos - period) % period;
+        let fade = repeat_fade(self.sample_rate, period);
+        let loop_l = loop_sample(&self.stutter_l[base..base + period], cursor, fade);
+        let loop_r = loop_sample(&self.stutter_r[base..base + period], cursor, fade);
+        self.voices[index].stutter_pos = self.voices[index].stutter_pos.wrapping_add(1);
+        let amount = amount.clamp(0.0, 1.0);
+        if amount >= 0.999 {
+            (loop_l, loop_r)
+        } else if amount <= 0.001 {
+            (left, right)
+        } else {
+            (
+                left * (1.0 - amount) + loop_l * amount,
+                right * (1.0 - amount) + loop_r * amount,
+            )
+        }
+    }
+
+    fn apply_drift(&mut self, index: usize) {
+        let sample_rate = self.sample_rate;
+        let voice = &mut self.voices[index];
+        if !voice.drift || voice.drift_len == 0 {
+            voice.drift_now = 1.0;
+            return;
+        }
+        let t = (voice.drift_pos as f32 / voice.drift_len as f32).min(1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        if voice.drift_pos < voice.drift_len {
+            voice.drift_pos += 1;
+        }
+        voice.drift_now = if voice.drift_from_center {
+            eased
+        } else {
+            1.0 - eased
+        };
+        if voice.dest_crush > 0.0 {
+            let amount = (voice.dest_crush * voice.drift_now).clamp(0.0, 1.0);
+            voice.crush = amount > 0.035;
+            voice.crush_steps =
+                voice.crush_target_steps + (96.0 - voice.crush_target_steps) * (1.0 - amount);
+            let hold = 1.0 + (voice.crush_target_len.saturating_sub(1) as f32) * amount;
+            voice.crush_len = hold.round().clamp(1.0, 96.0) as u32;
+        }
+        if voice.pass != PassMode::Off && voice.dest_pass > 0.0 {
+            let depth = (voice.dest_pass * voice.drift_now).clamp(0.0, 1.0);
+            let hz = drifted_hz(voice.pass, voice.pass_hz, depth);
+            voice.pass_coeff = cutoff_coeff(sample_rate, hz);
+        }
+    }
+
+    fn arm_escape(&mut self, voice: &mut Voice, tone: &EscapeTone) {
+        let sample_rate = self.sample_rate;
+        let region = self.escape_region.max(2);
+        let samples = |seconds: f32| -> usize {
+            (sample_rate * seconds).round().clamp(1.0, (region - 1) as f32) as usize
+        };
+        let comb_seconds = [0.0113_f32, 0.0137, 0.0169, 0.0197];
+        for (index, seconds) in comb_seconds.iter().enumerate() {
+            let len = samples(*seconds);
+            voice.escape_comb_len[index] = len;
+            voice.escape_comb_pos[index] = 0;
+            voice.escape_fb[index] = comb_feedback(len, sample_rate, tone.rt60);
+        }
+        voice.escape = true;
+        voice.escape_wet = tone.wet;
+        voice.escape_dry = tone.dry;
+        voice.escape_damp = [0.0; ESCAPE_COMBS];
+        voice.escape_damp_coeff = (tone.tone_hz / 8_000.0).clamp(0.08, 0.8);
+        voice.escape_pre_len = samples(tone.predelay);
+        voice.escape_pre_pos = 0;
+        voice.escape_ap_len = [samples(0.0053), samples(0.0017)];
+        voice.escape_ap_pos = [0, 0];
+        voice.escape_ap_fb = 0.62;
+        voice.escape_side_len = samples(0.0008);
+        voice.escape_side_pos = 0;
+        voice.escape_lp = 0.0;
+        voice.escape_lp_coeff = cutoff_coeff(sample_rate, tone.tone_hz);
+        voice.escape_tail = (tone.rt60 * sample_rate * 1.8).round().clamp(1.0, sample_rate * 0.45) as u32;
+    }
+
+    fn clear_escape(&mut self, index: usize) {
+        let region = self.escape_region.max(1);
+        let start = index.saturating_mul(ESCAPE_REGIONS).saturating_mul(region);
+        let end = start.saturating_add(ESCAPE_REGIONS.saturating_mul(region));
+        if end <= self.escape_buf.len() {
+            self.escape_buf[start..end].fill(0.0);
+        }
+    }
+
+    fn escape_mix(&mut self, index: usize, left: f32, right: f32) -> (f32, f32) {
+        if !self.voices[index].escape {
+            return (left, right);
+        }
+        let amount = effect_amount(&self.voices[index], self.voices[index].dest_escape);
+        let region = self.escape_region.max(1);
+        let start = index * ESCAPE_REGIONS * region;
+        let end = start + ESCAPE_REGIONS * region;
+        if end > self.escape_buf.len() {
+            return (left, right);
+        }
+
+        let voice = &self.voices[index];
+        let mut comb_pos = voice.escape_comb_pos;
+        let comb_len = voice.escape_comb_len;
+        let feedback = voice.escape_fb;
+        let mut damp = voice.escape_damp;
+        let damp_coeff = voice.escape_damp_coeff;
+        let mut pre_pos = voice.escape_pre_pos;
+        let pre_len = voice.escape_pre_len;
+        let mut ap_pos = voice.escape_ap_pos;
+        let ap_len = voice.escape_ap_len;
+        let ap_fb = voice.escape_ap_fb;
+        let mut side_pos = voice.escape_side_pos;
+        let side_len = voice.escape_side_len;
+        let mut lp = voice.escape_lp;
+        let lp_coeff = voice.escape_lp_coeff;
+        let wet_gain = voice.escape_wet * amount;
+        let dry_gain = 1.0 + (voice.escape_dry - 1.0) * amount;
+
+        let input = (left + right) * 0.5 * amount;
+        let buf = &mut self.escape_buf[start..end];
+        let pre = delay_tick(&mut buf[0..region], &mut pre_pos, pre_len, input);
+        let mut tank = 0.0f32;
+        for comb in 0..ESCAPE_COMBS {
+            let offset = (comb + 1) * region;
+            tank += comb_tick(
+                &mut buf[offset..offset + region],
+                &mut comb_pos[comb],
+                comb_len[comb],
+                &mut damp[comb],
+                damp_coeff,
+                feedback[comb],
+                pre,
+            );
+        }
+        tank = tank * 0.25 * 0.82 + pre * 0.18;
+        for ap in 0..2 {
+            let offset = (ESCAPE_COMBS + 1 + ap) * region;
+            tank = allpass_tick(
+                &mut buf[offset..offset + region],
+                &mut ap_pos[ap],
+                ap_len[ap],
+                ap_fb,
+                tank,
+            );
+        }
+        let wet_l = one_pole(&mut lp, tank, lp_coeff);
+        let side_offset = (ESCAPE_COMBS + 3) * region;
+        let wet_r = delay_tick(
+            &mut buf[side_offset..side_offset + region],
+            &mut side_pos,
+            side_len,
+            wet_l,
+        );
+
+        let voice = &mut self.voices[index];
+        voice.escape_comb_pos = comb_pos;
+        voice.escape_damp = damp;
+        voice.escape_pre_pos = pre_pos;
+        voice.escape_ap_pos = ap_pos;
+        voice.escape_side_pos = side_pos;
+        voice.escape_lp = lp;
+        (
+            left * dry_gain + wet_l * wet_gain,
+            right * dry_gain + wet_r * wet_gain,
+        )
     }
 
     /// Slide a new slice, in output samples, until its overlap matches the slice already
@@ -1089,6 +1903,22 @@ enum CrushDegree {
     Lot,
 }
 
+/// How far away an escaped note sits. Every degree stays a short wash.
+#[derive(Clone, Copy, PartialEq)]
+enum EscapeDegree {
+    Little,
+    Moderate,
+    Lot,
+}
+
+struct EscapeTone {
+    wet: f32,
+    dry: f32,
+    rt60: f32,
+    tone_hz: f32,
+    predelay: f32,
+}
+
 impl Engine {
     /// Deal the next crush degree. The bag is shuffled, then each degree is used once.
     fn take_crush(&mut self) -> CrushDegree {
@@ -1117,6 +1947,36 @@ impl Engine {
         self.smear_left -= 1;
         self.smear_bag[self.smear_left as usize]
     }
+
+    fn take_splatter(&mut self) -> SplatterDegree {
+        if self.splatter_left == 0 {
+            self.splatter_bag = [
+                SplatterDegree::Little,
+                SplatterDegree::Moderate,
+                SplatterDegree::Lot,
+            ];
+            for index in (1..3).rev() {
+                let swap = (self.rng.unit() * (index as f32 + 1.0)).floor() as usize;
+                self.splatter_bag.swap(index, swap);
+            }
+            self.splatter_left = 3;
+        }
+        self.splatter_left -= 1;
+        self.splatter_bag[self.splatter_left as usize]
+    }
+
+    fn take_escape(&mut self) -> EscapeDegree {
+        if self.escape_left == 0 {
+            self.escape_bag = [EscapeDegree::Little, EscapeDegree::Moderate, EscapeDegree::Lot];
+            for index in (1..3).rev() {
+                let swap = (self.rng.unit() * (index as f32 + 1.0)).floor() as usize;
+                self.escape_bag.swap(index, swap);
+            }
+            self.escape_left = 3;
+        }
+        self.escape_left -= 1;
+        self.escape_bag[self.escape_left as usize]
+    }
 }
 
 /// Bit depth and sample-hold for one degree. Moderate matches the original crush.
@@ -1132,6 +1992,109 @@ fn crush_setup(degree: CrushDegree, sample_rate: f32) -> (f32, u32) {
 
 fn quantize(sample: f32, steps: f32) -> f32 {
     (sample.clamp(-1.0, 1.0) * steps).round() / steps
+}
+
+fn escape_setup(degree: EscapeDegree) -> EscapeTone {
+    match degree {
+        EscapeDegree::Little => EscapeTone {
+            wet: 0.75,
+            dry: 0.58,
+            rt60: 0.09,
+            tone_hz: 2_600.0,
+            predelay: 0.008,
+        },
+        EscapeDegree::Moderate => EscapeTone {
+            wet: 0.86,
+            dry: 0.40,
+            rt60: 0.15,
+            tone_hz: 1_800.0,
+            predelay: 0.013,
+        },
+        EscapeDegree::Lot => EscapeTone {
+            wet: 1.0,
+            dry: 0.24,
+            rt60: 0.23,
+            tone_hz: 1_150.0,
+            predelay: 0.018,
+        },
+    }
+}
+
+fn escape_region_for(sample_rate: f32) -> usize {
+    (sample_rate * 0.022).ceil() as usize + 2
+}
+
+fn comb_feedback(delay_samples: usize, sample_rate: f32, rt60: f32) -> f32 {
+    let delay_t = delay_samples as f32 / sample_rate.max(1.0);
+    10.0_f32
+        .powf(-3.0 * delay_t / rt60.max(0.02))
+        .clamp(0.05, 0.7)
+}
+
+fn effect_amount(voice: &Voice, dest: f32) -> f32 {
+    if voice.drift {
+        (dest.clamp(0.0, 1.0) * voice.drift_now).clamp(0.0, 1.0)
+    } else if dest >= 0.5 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn drifted_hz(mode: PassMode, target: f32, depth: f32) -> f32 {
+    let depth = depth.clamp(0.0, 1.0);
+    match mode {
+        PassMode::Low => log_lerp(7_200.0, target, depth),
+        PassMode::High => log_lerp(48.0, target, depth),
+        PassMode::Off => target,
+    }
+}
+
+fn log_lerp(from: f32, to: f32, t: f32) -> f32 {
+    if t <= 0.0 {
+        from
+    } else if t >= 1.0 {
+        to
+    } else {
+        (from.max(1.0).ln() + (to.max(1.0).ln() - from.max(1.0).ln()) * t).exp()
+    }
+}
+
+fn delay_tick(buf: &mut [f32], pos: &mut usize, len: usize, input: f32) -> f32 {
+    let len = len.max(1).min(buf.len());
+    let cursor = *pos % len;
+    let out = buf[cursor];
+    buf[cursor] = input;
+    *pos = (cursor + 1) % len;
+    out
+}
+
+fn comb_tick(
+    buf: &mut [f32],
+    pos: &mut usize,
+    len: usize,
+    damp: &mut f32,
+    damp_coeff: f32,
+    feedback: f32,
+    input: f32,
+) -> f32 {
+    let len = len.max(1).min(buf.len());
+    let cursor = *pos % len;
+    let delayed = buf[cursor];
+    *damp += damp_coeff * (delayed - *damp);
+    buf[cursor] = input + *damp * feedback;
+    *pos = (cursor + 1) % len;
+    delayed
+}
+
+fn allpass_tick(buf: &mut [f32], pos: &mut usize, len: usize, feedback: f32, input: f32) -> f32 {
+    let len = len.max(1).min(buf.len());
+    let cursor = *pos % len;
+    let delayed = buf[cursor];
+    let out = delayed - feedback * input;
+    buf[cursor] = input + feedback * out;
+    *pos = (cursor + 1) % len;
+    out
 }
 
 /// How far a smeared note scatters its slices. Little is a blur, lot is a cloud.
@@ -1152,6 +2115,28 @@ struct SmearTone {
     flip: f32,
     shimmer: f32,
     width: f32,
+}
+
+/// How fine a splattered note's taps are. Little is a rustle, lot is a sprinkle.
+#[derive(Clone, Copy)]
+enum SplatterDegree {
+    Little,
+    Moderate,
+    Lot,
+}
+
+struct SplatterTone {
+    radius_secs: f64,
+    grain_secs: f64,
+    grain_lo: f32,
+    grain_hi: f32,
+    gap_min: f64,
+    gap_max: f64,
+    voices: u8,
+    detune: f32,
+    glint: f32,
+    width: f32,
+    gain: f32,
 }
 
 fn smear_setup(degree: SmearDegree) -> SmearTone {
@@ -1192,6 +2177,50 @@ fn smear_setup(degree: SmearDegree) -> SmearTone {
     }
 }
 
+fn splatter_setup(degree: SplatterDegree) -> SplatterTone {
+    match degree {
+        SplatterDegree::Little => SplatterTone {
+            radius_secs: 0.08,
+            grain_secs: 0.038,
+            grain_lo: 0.030_f32 / 0.038,
+            grain_hi: 0.048_f32 / 0.038,
+            gap_min: 0.080,
+            gap_max: 0.140,
+            voices: 2,
+            detune: 8.0,
+            glint: 0.30,
+            width: 0.35,
+            gain: 0.92,
+        },
+        SplatterDegree::Moderate => SplatterTone {
+            radius_secs: 0.25,
+            grain_secs: 0.024,
+            grain_lo: 0.018_f32 / 0.024,
+            grain_hi: 0.032_f32 / 0.024,
+            gap_min: 0.040,
+            gap_max: 0.080,
+            voices: 3,
+            detune: 12.0,
+            glint: 0.50,
+            width: 0.55,
+            gain: 0.82,
+        },
+        SplatterDegree::Lot => SplatterTone {
+            radius_secs: 0.50,
+            grain_secs: 0.014,
+            grain_lo: 0.010_f32 / 0.014,
+            grain_hi: 0.020_f32 / 0.014,
+            gap_min: 0.022,
+            gap_max: 0.048,
+            voices: 4,
+            detune: 16.0,
+            glint: 0.70,
+            width: 0.75,
+            gain: 0.68,
+        },
+    }
+}
+
 /// A long fade-in and a slower fade-out, so a slice blooms instead of pulsing.
 fn bloom_window(age: usize, len: usize) -> f32 {
     if len <= 1 {
@@ -1204,6 +2233,23 @@ fn bloom_window(age: usize, len: usize) -> f32 {
     } else {
         let u = ((t - 0.55) / 0.45).clamp(0.0, 1.0);
         0.5 + 0.5 * (u * std::f32::consts::PI).cos()
+    }
+}
+
+/// A short rise and a longer fall, so a slice ticks instead of blooming.
+fn tick_window(age: usize, len: usize, attack: usize) -> f32 {
+    if len <= 1 {
+        return 1.0;
+    }
+    let attack = attack.clamp(1, (len / 3).max(1));
+    let t = age as f32;
+    if t < attack as f32 {
+        let u = t / attack as f32;
+        (u * std::f32::consts::FRAC_PI_2).sin()
+    } else {
+        let span = (len - attack) as f32;
+        let u = ((t - attack as f32) / span).clamp(0.0, 1.0);
+        0.5 + 0.5 * ((1.0 - u) * std::f32::consts::PI).cos()
     }
 }
 
@@ -1242,8 +2288,32 @@ fn advance_env(voice: &mut Voice) {
     }
     if voice.releasing && voice.env <= 0.000_8 {
         voice.env = 0.0;
-        voice.active = false;
+        if voice.escape_tail > 0 {
+            voice.escape_tail -= 1;
+        } else {
+            voice.active = false;
+        }
     }
+}
+
+fn stutter_cap_for(sample_rate: f32) -> usize {
+    // An eighth note at the slowest clock, 20 BPM.
+    (sample_rate * 1.5).round() as usize + 4
+}
+
+fn repeat_fade(sample_rate: f32, period: usize) -> usize {
+    let fade = (sample_rate * 0.004).round() as usize;
+    fade.clamp(1, (period / 4).max(1)).min(period.saturating_sub(1))
+}
+
+fn loop_sample(buf: &[f32], cursor: usize, fade: usize) -> f32 {
+    let here = buf[cursor];
+    if fade == 0 || cursor >= fade {
+        return here;
+    }
+    let tail = buf[buf.len() - fade + cursor];
+    let t = (cursor as f32 / fade as f32).clamp(0.0, 1.0);
+    tail * (1.0 - t).sqrt() + here * t.sqrt()
 }
 
 fn grain_len_for(sample_rate: f32) -> usize {
@@ -1688,6 +2758,7 @@ mod tests {
                         reverse: 1.0,
                         pan: 0.0,
                         octave: 0.0,
+                        charm: 0.5,
                     },
                     SliceRolls::neutral(),
                 ],
@@ -1722,6 +2793,7 @@ mod tests {
                         reverse: 0.0,
                         pan: 0.0,
                         octave: 1.0,
+                        charm: 0.5,
                     },
                     SliceRolls::neutral(),
                 ],
@@ -1734,6 +2806,23 @@ mod tests {
         assert!(
             (freq - 440.0).abs() < 12.0,
             "an octave up from 220 Hz should be near 440, got {freq}"
+        );
+        let head = engine.playhead(0).unwrap();
+        assert!(
+            head > 12_000.0,
+            "a leap should walk the recording with the octave, playhead {head}"
+        );
+        let steady = &rendered[grain..grain + 12_000];
+        let mut loud = 0.0f32;
+        let mut quiet = f32::MAX;
+        for chunk in steady.chunks(800) {
+            let energy = chunk.iter().map(|sample| sample * sample).sum::<f32>() / chunk.len() as f32;
+            loud = loud.max(energy);
+            quiet = quiet.min(energy);
+        }
+        assert!(
+            quiet > loud * 0.45,
+            "a leap should stay even instead of chopping, quiet {quiet} loud {loud}"
         );
     }
 
@@ -1756,6 +2845,7 @@ mod tests {
                         reverse: 0.0,
                         pan: -1.0,
                         octave: 0.0,
+                        charm: 0.5,
                     },
                     SliceRolls::neutral(),
                 ],
@@ -1960,7 +3050,105 @@ mod tests {
     }
 
     #[test]
-    fn stutter_chops_the_note() {
+    fn splatter_deals_three_short_grains_and_replaces_the_note() {
+        let little = (44_100.0_f64 * 0.038).round() as usize;
+        let moderate = (44_100.0_f64 * 0.024).round() as usize;
+        let lot = (44_100.0_f64 * 0.014).round() as usize;
+        let mut engine = Engine::new(44_100.0, tone_bank(), 1);
+        engine.set_global(GlobalRoll {
+            splatter: 1.0,
+            ..GlobalRoll::off()
+        });
+        let mut dealt = [0usize; 3];
+        for index in 0..3 {
+            engine.note_on(
+                NoteOn {
+                    note: 60 + index as u8,
+                    velocity: 1.0,
+                    channel: 0,
+                    voice_id: Some(index as i32),
+                    sample: Some(0),
+                    start_norm: Some(0.0),
+                },
+                &[1.0],
+                &[SliceRolls::neutral()],
+                1.0,
+            );
+            dealt[index] = engine
+                .voices
+                .iter()
+                .find(|voice| voice.voice_id == Some(index as i32))
+                .unwrap()
+                .splatter_len;
+        }
+        dealt.sort_unstable();
+        assert_eq!(dealt, [lot, moderate, little]);
+
+        let mut clean = Engine::new(44_100.0, tone_bank(), 4);
+        let mut tapped = Engine::new(44_100.0, tone_bank(), 4);
+        tapped.set_global(GlobalRoll {
+            splatter: 1.0,
+            ..GlobalRoll::off()
+        });
+        let request = NoteOn {
+            note: 60,
+            velocity: 1.0,
+            channel: 0,
+            voice_id: None,
+            sample: Some(0),
+            start_norm: Some(0.2),
+        };
+        clean
+            .note_on(request, &[1.0], &[SliceRolls::neutral()], 1.0)
+            .unwrap();
+        tapped
+            .note_on(
+                NoteOn {
+                    note: 60,
+                    velocity: 1.0,
+                    channel: 0,
+                    voice_id: None,
+                    sample: Some(0),
+                    start_norm: Some(0.2),
+                },
+                &[1.0],
+                &[SliceRolls::neutral()],
+                1.0,
+            )
+            .unwrap();
+        let plain = render_for(&mut clean, 12_000, 60, 1.0);
+        let patter = render_for(&mut tapped, 12_000, 60, 1.0);
+        let difference = plain
+            .iter()
+            .zip(&patter)
+            .map(|(dry, wet)| (dry - wet).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            difference > 0.15,
+            "splatter should replace the note with taps, peak difference {difference}"
+        );
+        let likeness = correlation(&plain, &patter);
+        assert!(
+            likeness < 0.85,
+            "the steady note should drop out between taps, correlation {likeness}"
+        );
+        let shortest = (44_100.0_f64 * 0.010).round() as usize;
+        let longest = (44_100.0_f64 * 0.048).round() as usize;
+        let grain = tapped
+            .voices[0]
+            .splatter_grains
+            .iter()
+            .find(|grain| grain.len > 0)
+            .expect("a tap should have been dealt");
+        assert!(
+            grain.len >= shortest && grain.len <= longest,
+            "tap length {} should stay between {shortest} and {longest}",
+            grain.len
+        );
+    }
+
+    #[test]
+    fn stutter_loops_the_captured_division() {
         let mut engine = Engine::new(44_100.0, tone_bank(), 1);
         engine.set_clock(120.0);
         engine.set_global(GlobalRoll {
@@ -1968,23 +3156,42 @@ mod tests {
             ..GlobalRoll::off()
         });
         hold_first(&mut engine, 0.0);
-        let mut quiet = 0usize;
-        let mut heard = 0usize;
-        for frame in 0..22_050 {
-            let (left, _) = engine.render(60, 1.0, true);
-            if frame < 4_000 {
-                continue;
-            }
-            if left.abs() < 1.0e-4 {
-                quiet += 1;
-            } else {
-                heard += 1;
-            }
-        }
-        assert!(heard > 1_000, "the stutter should still sound, heard {heard}");
+        let period = engine.voices[0].stutter_len as usize;
+        let divisions = [0.5_f32, 0.25, 1.0 / 6.0, 0.125];
+        let expected: Vec<usize> = divisions
+            .iter()
+            .map(|beats| (beats * 60.0 / 120.0 * 44_100.0).round() as usize)
+            .collect();
         assert!(
-            quiet > heard / 2,
-            "the stutter should cut the note, quiet {quiet} heard {heard}"
+            expected.contains(&period),
+            "period {period} should be an eighth, sixteenth, triplet, or thirty-second"
+        );
+
+        let mut out = Vec::with_capacity(period * 4);
+        for _ in 0..(period * 4) {
+            out.push(engine.render(60, 1.0, true).0);
+        }
+        let fade = (44_100.0_f32 * 0.004).round() as usize;
+        let body = fade..period - fade;
+        for (captured, rolled) in out[body.clone()].iter().zip(&out[period + body.start..]) {
+            assert!(
+                (captured - rolled).abs() < 1.0e-6,
+                "the roll should repeat the captured slice"
+            );
+        }
+        let first_roll = &out[period..period * 2];
+        let second_roll = &out[period * 2..period * 3];
+        assert!(
+            correlation(first_roll, second_roll) > 0.999,
+            "each retrigger should be the same slice"
+        );
+        let heard = out[period..period * 3]
+            .iter()
+            .filter(|sample| sample.abs() >= 1.0e-4)
+            .count();
+        assert!(
+            heard > period,
+            "the roll should keep sounding through the division, heard {heard}"
         );
     }
 
@@ -2012,5 +3219,194 @@ mod tests {
             high_energy > dry * 0.5,
             "a high pass should keep 3 kHz, high {high_energy} dry {dry}"
         );
+    }
+
+    #[test]
+    fn escape_deals_three_short_washes() {
+        let mut engine = Engine::new(44_100.0, tone_bank(), 1);
+        engine.set_global(GlobalRoll {
+            escape: 1.0,
+            ..GlobalRoll::off()
+        });
+        let mut wet = [0.0f32; 3];
+        for index in 0..3 {
+            engine
+                .note_on(
+                    NoteOn {
+                        note: 60 + index as u8,
+                        velocity: 1.0,
+                        channel: 0,
+                        voice_id: Some(index as i32),
+                        sample: Some(0),
+                        start_norm: Some(0.0),
+                    },
+                    &[1.0],
+                    &[SliceRolls::neutral()],
+                    1.0,
+                )
+                .unwrap();
+            wet[index] = engine
+                .voices
+                .iter()
+                .find(|voice| voice.voice_id == Some(index as i32))
+                .unwrap()
+                .escape_wet;
+            assert!(engine.voices[index].escape_tail > 0);
+            assert!(engine.voices[index].escape_tail <= (44_100.0 * 0.45) as u32);
+        }
+        wet.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((wet[0] - 0.75).abs() < 1.0e-4);
+        assert!((wet[1] - 0.86).abs() < 1.0e-4);
+        assert!((wet[2] - 1.0).abs() < 1.0e-4);
+
+        let mut dry = Engine::new(44_100.0, tone_bank(), 4);
+        let mut washed = Engine::new(44_100.0, tone_bank(), 4);
+        washed.set_global(GlobalRoll {
+            escape: 1.0,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut dry, 0.1);
+        hold_first(&mut washed, 0.1);
+        let mut difference = 0.0f32;
+        let mut plain = 0.0f32;
+        let mut width = 0.0f32;
+        for _ in 0..8_000 {
+            let (dry_l, _) = dry.render(60, 1.0, true);
+            let (wet_l, wet_r) = washed.render(60, 1.0, true);
+            difference += (dry_l - wet_l).abs();
+            plain += dry_l.abs();
+            width += (wet_l - wet_r).abs();
+        }
+        assert!(
+            difference > plain * 0.12,
+            "escape should set the note back, difference {difference} plain {plain}"
+        );
+        assert!(width > 1.0, "the wash should sit apart from the dry stereo, width {width}");
+
+        washed.note_off(0, 60, None, 1.0);
+        let mut tail = 0.0f32;
+        for _ in 0..2_000 {
+            let (left, _) = washed.render(60, 1.0, true);
+            tail += left.abs();
+        }
+        assert!(tail > 0.05, "the short tail should still speak, energy {tail}");
+        let mut late = 0.0f32;
+        for _ in 0..(44_100 / 2) {
+            let (left, _) = washed.render(60, 1.0, true);
+            late = left.abs();
+        }
+        assert!(late < 1.0e-3, "the wash should be gone within half a second, left {late}");
+        assert!(!washed.any_active());
+    }
+
+    #[test]
+    fn drift_moves_between_dry_and_the_set_knobs() {
+        let mut settled = Engine::new(44_100.0, tone_bank(), 5);
+        let mut empty = Engine::new(44_100.0, tone_bank(), 5);
+        empty.set_global(GlobalRoll {
+            drift: 1.0,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut settled, 0.2);
+        hold_first(&mut empty, 0.2);
+        assert!(empty.voices[0].drift);
+        assert!(empty.voices[0].dest_pass < 0.001);
+        let plain = render_for(&mut settled, 8_000, 60, 1.0);
+        let untouched = render_for(&mut empty, 8_000, 60, 1.0);
+        assert!(
+            correlation(&plain, &untouched) > 0.999,
+            "drift with every other knob down should leave the note dry"
+        );
+
+        let mut moving = Engine::new(44_100.0, tone_bank(), 2);
+        moving.set_global(GlobalRoll {
+            drift: 1.0,
+            pass: 1.0,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut moving, 0.0);
+        let voice = &moving.voices[0];
+        assert!(voice.dest_pass > 0.99);
+        assert!(voice.pass != PassMode::Off);
+        let start = voice.pass_coeff;
+        let travel = voice.drift_len as usize;
+        for _ in 0..travel {
+            moving.render(60, 1.0, true);
+        }
+        let end = moving.voices[0].pass_coeff;
+        assert!(
+            (start - end).abs() > 0.002,
+            "the filter should travel between open and the pass destination, {start} -> {end}"
+        );
+        let toward_center = !moving.voices[0].drift_from_center;
+        if toward_center {
+            assert!(moving.voices[0].drift_now < 0.05);
+        } else {
+            assert!(moving.voices[0].drift_now > 0.95);
+        }
+    }
+
+    fn note_with_charm(engine: &mut Engine, charm: f32) {
+        let mut rolls = [SliceRolls::neutral(); 2];
+        rolls[0].charm = charm;
+        engine
+            .note_on(
+                NoteOn {
+                    note: 60,
+                    velocity: 1.0,
+                    channel: 0,
+                    voice_id: None,
+                    sample: Some(0),
+                    start_norm: Some(0.0),
+                },
+                &[1.0, 1.0],
+                &rolls,
+                1.0,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn charm_shields_at_zero_and_catches_one_effect_at_full() {
+        let mut shielded = Engine::new(44_100.0, tone_bank(), 3);
+        shielded.set_global(GlobalRoll {
+            swell: 1.0,
+            crush: 1.0,
+            escape: 1.0,
+            ..GlobalRoll::off()
+        });
+        note_with_charm(&mut shielded, 0.0);
+        let voice = &shielded.voices[0];
+        assert!(!voice.reverse, "charm at zero should skip swell");
+        assert!(!voice.crush, "charm at zero should skip crush");
+        assert!(!voice.escape, "charm at zero should skip escape");
+
+        let mut balanced = Engine::new(44_100.0, tone_bank(), 3);
+        balanced.set_global(GlobalRoll {
+            escape: 1.0,
+            ..GlobalRoll::off()
+        });
+        note_with_charm(&mut balanced, 0.5);
+        assert!(balanced.voices[0].escape, "noon should leave a full knob alone");
+
+        let mut charmed = Engine::new(44_100.0, tone_bank(), 8);
+        charmed.set_global(GlobalRoll {
+            escape: 0.15,
+            ..GlobalRoll::off()
+        });
+        for index in 0..6 {
+            charmed.silence();
+            note_with_charm(&mut charmed, 1.0);
+            assert!(
+                charmed.voices[0].escape,
+                "full charm should catch the only enabled effect, note {index}"
+            );
+        }
+
+        let mut quiet = Engine::new(44_100.0, tone_bank(), 8);
+        quiet.set_global(GlobalRoll::off());
+        note_with_charm(&mut quiet, 1.0);
+        let voice = &quiet.voices[0];
+        assert!(!voice.escape && !voice.crush && !voice.smear && !voice.drift);
     }
 }

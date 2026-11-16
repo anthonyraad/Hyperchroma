@@ -1,5 +1,7 @@
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
+use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::{BoolParam, FloatParam, Param, ParamSetter};
 use nih_plug_egui::egui::{self, Color32, Mesh, RichText, Stroke, StrokeKind, Vec2};
 use nih_plug_egui::resizable_window::ResizableWindow;
@@ -16,9 +18,35 @@ const PAPER: Color32 = Color32::from_rgb(245, 240, 230);
 const POLLEN: Color32 = Color32::from_rgb(224, 186, 122);
 const WARN: Color32 = Color32::from_rgb(214, 148, 110);
 
+/// Sound boxes are 15% narrower than the 117.6px boxes the 670px window used.
+/// Their height stays on that proportion, so the left column does not reflow
+/// when the controls fold out.
+const TILE_W_BEFORE: f32 = (636.0 - 12.0 * 4.0) / 5.0;
+const TILE_W: f32 = TILE_W_BEFORE * 0.85;
+const TILE_H: f32 = TILE_W_BEFORE * 0.82;
+const TILE_GAP: f32 = 12.0;
+const GRID_W: f32 = TILE_W * 5.0 + TILE_GAP * 4.0;
+/// The knob column, 15% narrower than the 522px column of the 1220px window.
+const CONTROLS_W: f32 = 522.0 * 0.85;
+const COLUMN_GAP: f32 = 28.0;
+const MARGIN_L: i8 = 18;
+const MARGIN_R: i8 = 16;
+const MARGIN_T: i8 = 6;
+const MARGIN_B: i8 = 6;
+
+pub const WINDOW_COLLAPSED: (u32, u32) = (582, 510);
+const WINDOW_EXPANDED: (u32, u32) = (1054, 510);
+
 pub struct KbState {
     settings_open: bool,
+    /// The right-hand controls and the settings gear. The editor opens folded.
+    controls_open: bool,
+    /// Window size to restore the next time the controls fold out.
+    expanded_size: (u32, u32),
+    /// Applied on the next frame, before layout, so the host and the grid agree.
+    pending_resize: Option<(u32, u32)>,
     /// Index into `SAMPLE_NAMES` whose knobs are open. `None` until a box is clicked.
+    /// A click on empty paper clears it.
     selected: Option<usize>,
     /// Keytracking edit the host has not applied yet.
     keytrack_edit: Option<PendingBool>,
@@ -30,6 +58,9 @@ impl KbState {
     pub fn new() -> Self {
         Self {
             settings_open: false,
+            controls_open: false,
+            expanded_size: WINDOW_EXPANDED,
+            pending_resize: None,
             selected: None,
             keytrack_edit: None,
             sync_edit: None,
@@ -43,36 +74,89 @@ pub fn draw(
     kb: &mut KbState,
     params: &HyperchromaParams,
     shared: &SharedUi,
-    egui_state: &EguiState,
+    egui_state: &Arc<EguiState>,
 ) {
     theme(ctx);
+    if let Some(size) = kb.pending_resize.take() {
+        request_window_size(egui_state, setter, ctx, size);
+    }
+    let min_size = if kb.controls_open {
+        Vec2::new(WINDOW_EXPANDED.0 as f32, WINDOW_EXPANDED.1 as f32)
+    } else {
+        Vec2::new(WINDOW_COLLAPSED.0 as f32, WINDOW_COLLAPSED.1 as f32)
+    };
     ResizableWindow::new("hyperchroma")
-        .min_size(Vec2::new(880.0, 860.0))
+        .min_size(min_size)
         .show(ctx, egui_state, |ui| {
+            let empty = ui.interact(ui.max_rect(), ui.id().with("empty"), egui::Sense::click());
             let snap = snapshot(shared);
             egui::Frame::new()
                 .inner_margin(egui::Margin {
-                    left: 18,
-                    right: 16,
-                    top: 6,
-                    bottom: 8,
+                    left: MARGIN_L,
+                    right: MARGIN_R,
+                    top: MARGIN_T,
+                    bottom: MARGIN_B,
                 })
                 .show(ui, |ui| {
-                    header(ui, &mut kb.settings_open);
+                    // Stay on the color grid until the window has actually grown.
+                    // Drawing the knobs a frame early squeezes the tiles.
+                    let shown = kb.controls_open
+                        && ui.available_width()
+                            >= GRID_W + COLUMN_GAP + CONTROLS_W - 8.0;
+                    header(ui, kb, egui_state, shown);
                     ui.add_space(10.0);
-                    recordings(ui, setter, kb, params, shared, &snap);
+                    recordings(ui, setter, kb, params, shared, &snap, shown);
                 });
-            if kb.settings_open {
+            if let Some(text) = ui.ctx().data(|data| {
+                data.get_temp::<&'static str>(egui::Id::new("hyperchroma-knob-help"))
+            }) {
+                let bounds = ui.max_rect();
+                ui.painter().text(
+                    egui::pos2(bounds.left() + MARGIN_L as f32, bounds.bottom() - 4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    text,
+                    egui::FontId::proportional(12.0),
+                    STONE,
+                );
+            }
+            ui.ctx().data_mut(|data| {
+                data.remove::<&'static str>(egui::Id::new("hyperchroma-knob-help"));
+            });
+            if kb.controls_open && kb.settings_open {
                 settings_panel(ui.ctx(), setter, kb, params, shared, &snap);
             } else {
                 // A click can close the panel before the host has taken the edit.
                 settle_bool(setter, &params.keytrack, &mut kb.keytrack_edit, None);
                 settle_bool(setter, &params.sync, &mut kb.sync_edit, None);
             }
+            if empty.clicked() {
+                kb.selected = None;
+            }
         });
 }
 
+/// Ask the host for a new editor size. `EguiState::set_requested_size` is private, so the
+/// persisted size is updated and the host is asked to resize to whatever `size()` reports.
+fn request_window_size(
+    egui_state: &Arc<EguiState>,
+    setter: &ParamSetter,
+    ctx: &egui::Context,
+    size: (u32, u32),
+) {
+    let Ok(owned) = Arc::try_unwrap(EguiState::from_size(size.0, size.1)) else {
+        return;
+    };
+    PersistentField::set(egui_state, owned);
+    let _ = setter.raw_context.request_resize();
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+        size.0 as f32,
+        size.1 as f32,
+    )));
+    ctx.request_repaint();
+}
+
 pub(crate) fn theme(ctx: &egui::Context) {
+    install_manrope(ctx);
     let mut visuals = egui::Visuals::dark();
     visuals.window_fill = PAPER;
     visuals.panel_fill = PAPER;
@@ -85,24 +169,114 @@ pub(crate) fn theme(ctx: &egui::Context) {
     visuals.selection.bg_fill = POLLEN;
     visuals.selection.stroke = Stroke::new(1.0_f32, INK);
     ctx.set_visuals(visuals);
+    ctx.options_mut(|options| {
+        options.input_options.max_double_click_delay = DOUBLE_PRESS;
+    });
 }
 
-fn header(ui: &mut egui::Ui, settings_open: &mut bool) {
+fn install_manrope(ctx: &egui::Context) {
+    let id = egui::Id::new("hyperchroma-manrope");
+    if ctx.data(|data| data.get_temp::<bool>(id).unwrap_or(false)) {
+        return;
+    }
+    ctx.data_mut(|data| data.insert_temp(id, true));
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Manrope".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../fonts/Manrope-Medium.ttf"
+        ))),
+    );
+    if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        proportional.insert(0, "Manrope".to_owned());
+    }
+    if let Some(monospace) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        monospace.insert(0, "Manrope".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn header(ui: &mut egui::Ui, kb: &mut KbState, egui_state: &Arc<EguiState>, shown: bool) {
     let width = ui.available_width();
-    ui.horizontal(|ui| {
-        ui.set_min_width(width);
-        ui.label(
-            RichText::new("Hyperchroma")
-                .size(30.0)
-                .color(INK)
-                .strong(),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if gear_button(ui, *settings_open).clicked() {
-                *settings_open = !*settings_open;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 40.0), egui::Sense::hover());
+    let title_rect = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * 0.7, rect.height()));
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(title_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| {
+            ui.label(
+                RichText::new("Hyperchroma")
+                    .size(30.0)
+                    .color(INK)
+                    .strong(),
+            );
+        },
+    );
+    // The marks stay on the grid's right edge, which is where `>>` sits while folded.
+    let grid_right = (rect.left() + GRID_W).min(rect.right());
+    let buttons = egui::Rect::from_min_max(
+        egui::pos2(grid_right - 48.0, rect.top()),
+        egui::pos2(grid_right, rect.bottom()),
+    );
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(buttons)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        |ui| {
+            if fold_button(ui, !shown).clicked() {
+                toggle_controls(kb, egui_state);
             }
-        });
-    });
+        },
+    );
+    if shown {
+        let gear = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - 28.0, rect.top()),
+            egui::pos2(rect.right(), rect.bottom()),
+        );
+        ui.allocate_new_ui(
+            egui::UiBuilder::new()
+                .max_rect(gear)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                if gear_button(ui, kb.settings_open).clicked() {
+                    kb.settings_open = !kb.settings_open;
+                }
+            },
+        );
+    }
+}
+
+fn toggle_controls(kb: &mut KbState, egui_state: &EguiState) {
+    if kb.controls_open {
+        let current = egui_state.size();
+        if current.0 > WINDOW_COLLAPSED.0 + 40 {
+            kb.expanded_size = current;
+        }
+        kb.controls_open = false;
+        kb.settings_open = false;
+        kb.pending_resize = Some(WINDOW_COLLAPSED);
+    } else {
+        kb.controls_open = true;
+        kb.pending_resize = Some(kb.expanded_size);
+    }
+}
+
+/// `>>` folds the controls out, `<<` folds them away. Ink on the paper, no fill.
+/// The two carets are drawn separately so they can sit closer than the font's pair.
+fn fold_button(ui: &mut egui::Ui, expand: bool) -> egui::Response {
+    let mark = if expand { ">" } else { "<" };
+    let font = egui::FontId::proportional(20.0);
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(mark.to_owned(), font, INK));
+    let advance = galley.size().x;
+    let step = advance * 0.64;
+    let total = advance + step;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(total + 4.0, 28.0), egui::Sense::click());
+    let left = rect.center().x - total * 0.5;
+    let top = rect.center().y - galley.size().y * 0.5;
+    ui.painter().galley(egui::pos2(left, top), galley.clone(), INK);
+    ui.painter().galley(egui::pos2(left + step, top), galley, INK);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn gear_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
@@ -141,22 +315,47 @@ fn recordings(
     params: &HyperchromaParams,
     shared: &SharedUi,
     snap: &crate::BankSnapshot,
+    shown: bool,
+) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = if shown { COLUMN_GAP } else { 0.0 };
+        ui.vertical(|ui| color_grid(ui, kb, shared, snap));
+        if !shown {
+            return;
+        }
+        ui.vertical(|ui| {
+            ui.set_min_width(CONTROLS_W);
+            global_knobs(ui, setter, params);
+            if let Some(index) = kb.selected {
+                let name = SAMPLE_NAMES[index];
+                if let Some(slice) = params.slice(name) {
+                    ui.add_space(18.0 * 0.85);
+                    if sound_knobs(ui, setter, name, slice) {
+                        if let Some(slot) = snap.infos.iter().position(|info| info.name == name) {
+                            shared.preview_slot.store(slot as u32, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+
+fn color_grid(
+    ui: &mut egui::Ui,
+    kb: &mut KbState,
+    shared: &SharedUi,
+    snap: &crate::BankSnapshot,
 ) {
     const COLS: usize = 5;
     const ROWS: usize = 4;
-    let gap = 12.0;
-    ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
-    let avail = ui.available_size();
-    let tile_w = ((avail.x - gap * (COLS - 1) as f32) / COLS as f32 - 1.0).max(88.0);
-    // Wider than tall, and short enough that the grid does not fill the window.
-    let tile_h = (tile_w * 0.62).clamp(56.0, 104.0);
-    let tile_w = tile_w * 0.85 * 0.9;
-    let tile_size = egui::vec2(tile_w, tile_h);
     let mask = shared.active_mask.load(Ordering::Relaxed);
-
+    ui.set_width(GRID_W);
+    ui.spacing_mut().item_spacing = egui::vec2(TILE_GAP, TILE_GAP);
+    let tile_size = egui::vec2(TILE_W, TILE_H);
     for row in 0..ROWS {
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
+            ui.spacing_mut().item_spacing.x = TILE_GAP;
             for col in 0..COLS {
                 let name = SAMPLE_NAMES[row * COLS + col];
                 let info = snap.infos.iter().find(|info| info.name == name);
@@ -186,21 +385,6 @@ fn recordings(
             }
         });
     }
-
-    if let Some(index) = kb.selected {
-        let name = SAMPLE_NAMES[index];
-        if let Some(slice) = params.slice(name) {
-            ui.add_space(8.0);
-            if sound_knobs(ui, setter, name, slice) {
-                if let Some(slot) = snap.infos.iter().position(|info| info.name == name) {
-                    shared.preview_slot.store(slot as u32, Ordering::Release);
-                }
-            }
-        }
-    }
-
-    ui.add_space(10.0);
-    global_knobs(ui, setter, params);
 }
 
 fn tile(
@@ -215,14 +399,15 @@ fn tile(
 ) -> bool {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let radius = 4.0;
+    let base = tile_color(name);
     let fill = if !loaded {
         Color32::from_rgb(28, 34, 32)
     } else if playing {
-        lighten(tile_color(name), 16)
+        lighten(base, 16)
     } else if response.hovered() {
-        lighten(tile_color(name), 10)
+        lighten(base, 10)
     } else {
-        tile_color(name)
+        base
     };
 
     if ui.is_rect_visible(rect) {
@@ -272,7 +457,7 @@ fn settings_panel(
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-20.0, 58.0))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-(MARGIN_R as f32), 50.0))
         .default_width(440.0)
         .max_height(max_h)
         .vscroll(true)
@@ -405,20 +590,65 @@ fn sample_peak(mins: &[f32], maxs: &[f32], index: f32) -> (f32, f32) {
 const DIAL: Color32 = Color32::from_rgb(0xf6, 0xf5, 0xfc);
 const DIAL_OUTLINE: Color32 = Color32::from_rgb(0x4a, 0x4a, 0x4a);
 const DIAL_TRACK: Color32 = Color32::from_rgb(0xba, 0xb5, 0xd1);
-const DIAL_ARC: Color32 = Color32::from_rgb(0x7c, 0x6e, 0xbb);
+const DIAL_ARC: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
 const DIAL_INK: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
 const ROTARY_START: f32 = std::f32::consts::PI * 1.2;
 const ROTARY_END: f32 = std::f32::consts::PI * 2.8;
+const KNOB_SLOT: f32 = 96.0;
+const VALUE_HOLD: f64 = 0.9;
+const DOUBLE_PRESS: f64 = 0.5;
 
 fn global_knobs(ui: &mut egui::Ui, setter: &ParamSetter, params: &HyperchromaParams) {
-    let knobs: [(&str, &FloatParam, bool); 5] = [
+    let top: [(&str, &FloatParam, bool); 4] = [
         ("Swell", &params.swell, false),
         ("Crush", &params.crush, false),
         ("Pass", &params.pass, false),
         ("Stutter", &params.stutter, false),
-        ("Smear", &params.smear, false),
     ];
-    knob_row(ui, setter, "global", &knobs);
+    let bottom: [(&str, &FloatParam, bool); 4] = [
+        ("Smear", &params.smear, false),
+        ("Splatter", &params.splatter, false),
+        ("Wash", &params.escape, false),
+        ("Drift", &params.drift, false),
+    ];
+    let full = ui.available_width();
+    let row_h = KNOB_SLOT;
+    let gap = 2.0 * 0.85;
+    let pad_x = 10.0;
+    let pad_y = 6.0 * 0.85;
+    let cluster = (full - pad_x * 2.0).max(88.0);
+    let box_w = full;
+    let box_h = pad_y * 2.0 + row_h * 2.0 + gap;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(full, box_h), egui::Sense::hover());
+    let frame = egui::Rect::from_min_size(rect.min, egui::vec2(box_w, box_h));
+    ui.painter().rect_stroke(
+        frame,
+        7.0,
+        Stroke::new(1.0_f32, Color32::from_rgb(148, 138, 124)),
+        StrokeKind::Inside,
+    );
+    place_knobs(
+        ui,
+        setter,
+        "global",
+        frame.left() + pad_x,
+        frame.top() + pad_y,
+        cluster,
+        row_h,
+        4,
+        &top,
+    );
+    place_knobs(
+        ui,
+        setter,
+        "global-2",
+        frame.left() + pad_x,
+        frame.top() + pad_y + row_h + gap,
+        cluster,
+        row_h,
+        4,
+        &bottom,
+    );
 }
 
 fn sound_knobs(
@@ -428,9 +658,8 @@ fn sound_knobs(
     slice: &crate::SliceParams,
 ) -> bool {
     let full = ui.available_width();
-    let row = full * 0.62;
     let label_h = 26.0;
-    let height = 118.0;
+    let height = KNOB_SLOT;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(full, label_h + height), egui::Sense::hover());
     let font = egui::FontId::proportional(16.0);
     let galley = ui.fonts(|fonts| fonts.layout_no_wrap(color_label(name).to_owned(), font, INK));
@@ -445,13 +674,24 @@ fn sound_knobs(
         name,
         egui::pos2(rect.left() + text_width + 16.0, rect.top() + label_h * 0.5),
     );
-    let knobs: [(&str, &FloatParam, bool); 4] = [
+    let knobs: [(&str, &FloatParam, bool); 5] = [
         ("Luck", &slice.probability, false),
         ("Reverse", &slice.reverse, false),
         ("Spread", &slice.pan, true),
         ("Leap", &slice.octave, false),
+        ("Charm", &slice.charm, true),
     ];
-    place_knobs(ui, setter, name, rect.left(), rect.top() + label_h, row, height, &knobs);
+    place_knobs(
+        ui,
+        setter,
+        name,
+        rect.left(),
+        rect.top() + label_h,
+        full,
+        height,
+        knobs.len(),
+        &knobs,
+    );
     play
 }
 
@@ -479,15 +719,6 @@ fn play_button(ui: &mut egui::Ui, name: &str, center: egui::Pos2) -> bool {
         .clicked()
 }
 
-fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, salt: &str, knobs: &[(&str, &FloatParam, bool)]) {
-    let full = ui.available_width();
-    // Keep each dial the same size as the four sound knobs, and let a fifth sit to their right.
-    let row = full * 0.62 * knobs.len() as f32 / 4.0;
-    let height = 118.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(full, height), egui::Sense::hover());
-    place_knobs(ui, setter, salt, rect.left(), rect.top(), row, height, knobs);
-}
-
 fn place_knobs(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
@@ -496,9 +727,11 @@ fn place_knobs(
     top: f32,
     row: f32,
     height: f32,
+    slots: usize,
     knobs: &[(&str, &FloatParam, bool)],
 ) {
-    let slot_w = row / knobs.len() as f32;
+    let slots = slots.max(knobs.len()).max(1);
+    let slot_w = row / slots as f32;
     for (index, (label, param, bipolar)) in knobs.iter().enumerate() {
         let center_x = left + slot_w * (index as f32 + 0.5);
         let slot = egui::Rect::from_center_size(
@@ -515,51 +748,180 @@ fn place_knobs(
     }
 }
 
+/// A double-click reset that has to stay open across frames.
+///
+/// Cubase throws away a parameter edit that begins and ends in the same frame,
+/// which is what sent the knob straight back to the value it already had.
+#[derive(Clone, Copy)]
+struct PendingReset {
+    frames: u32,
+    open: bool,
+}
+
 /// Haunter's plain dial: a light disc, a track, an accent arc, and a dark pointer.
 /// Drag up to increase. Shift drags finer. Double-click returns the default.
-fn draw_knob(ui: &mut egui::Ui, setter: &ParamSetter, param: &impl Param, name: &str, bipolar: bool) {
+fn draw_knob(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    param: &impl Param,
+    name: &str,
+    bipolar: bool,
+) {
     let width = ui.available_width().clamp(88.0, 150.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 112.0), egui::Sense::click_and_drag());
-    let normalized = param.modulated_normalized_value();
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, KNOB_SLOT), egui::Sense::click_and_drag());
+    let mut normalized = param.modulated_normalized_value();
     let memory = ui.id().with(name);
-
-    if response.drag_started_by(egui::PointerButton::Primary) {
-        setter.begin_set_parameter(param);
-        ui.memory_mut(|mem| {
-            mem.data.insert_temp(memory.with("start"), normalized);
-            mem.data.insert_temp(memory.with("drag"), 0.0f32);
-            mem.data.insert_temp(memory.with("turning"), true);
-        });
-    }
-    let turning = ui
+    let now = ui.input(|input| input.time);
+    let pointer_down = response.is_pointer_button_down_on();
+    let was_down = ui
+        .memory(|mem| mem.data.get_temp::<bool>(memory.with("down")))
+        .unwrap_or(false);
+    let last_press = ui
+        .memory(|mem| mem.data.get_temp::<f64>(memory.with("press")))
+        .unwrap_or(f64::NEG_INFINITY);
+    let suppress = ui
+        .memory(|mem| mem.data.get_temp::<bool>(memory.with("suppress")))
+        .unwrap_or(false);
+    let press_count = ui.input(|input| {
+        input
+            .events
+            .iter()
+            .filter(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    ..
+                } => *button == egui::PointerButton::Primary && rect.contains(*pos),
+                _ => false,
+            })
+            .count()
+    });
+    let started = press_count > 0 || (pointer_down && !was_down);
+    // A second press is a reset even when the pointer moved enough that egui
+    // calls the gesture a drag instead of a double-click.
+    let double = response.double_clicked()
+        || press_count >= 2
+        || (started && now - last_press < DOUBLE_PRESS);
+    let mut turning = ui
         .memory(|mem| mem.data.get_temp::<bool>(memory.with("turning")))
         .unwrap_or(false);
-    if turning && response.dragged() {
-        let (start, mut dragged) = ui.memory(|mem| {
-            (
-                mem.data
-                    .get_temp::<f32>(memory.with("start"))
-                    .unwrap_or(normalized),
-                mem.data
-                    .get_temp::<f32>(memory.with("drag"))
-                    .unwrap_or(0.0),
-            )
-        });
-        dragged += -response.drag_delta().y;
-        ui.memory_mut(|mem| mem.data.insert_temp(memory.with("drag"), dragged));
-        let fine = ui.input(|input| input.modifiers.shift);
-        let scale = if fine { 0.0015 } else { 1.0 / 140.0 };
-        let next = (start + dragged * scale).clamp(0.0, 1.0);
-        setter.set_parameter(param, param.preview_plain(next));
-    }
-    if response.double_clicked() {
-        setter.begin_set_parameter(param);
+    let mut reset = ui.memory(|mem| mem.data.get_temp::<PendingReset>(memory.with("reset")));
+
+    if double {
+        if !turning && !reset.is_some_and(|edit| edit.open) {
+            setter.begin_set_parameter(param);
+            ui.memory_mut(|mem| mem.data.insert_temp(memory.with("turning"), true));
+        }
         setter.set_parameter(param, param.default_plain_value());
-        setter.end_set_parameter(param);
+        reset = Some(PendingReset {
+            frames: 0,
+            open: true,
+        });
+        ui.memory_mut(|mem| {
+            mem.data.insert_temp(memory.with("press"), f64::NEG_INFINITY);
+            mem.data.insert_temp(memory.with("shown"), now);
+            mem.data.insert_temp(memory.with("suppress"), true);
+        });
+    } else if reset.is_some_and(|edit| edit.open) {
+        setter.set_parameter(param, param.default_plain_value());
+        let edit = reset.as_mut().unwrap();
+        edit.frames = edit.frames.saturating_add(1);
+        if edit.frames >= BOOL_HOLD_FRAMES {
+            setter.end_set_parameter(param);
+            edit.open = false;
+            edit.frames = 0;
+            ui.memory_mut(|mem| mem.data.remove::<bool>(memory.with("turning")));
+        }
+        ui.ctx().request_repaint();
+    } else if !suppress {
+        if started || response.clicked() {
+            ui.memory_mut(|mem| mem.data.insert_temp(memory.with("press"), now));
+        }
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            setter.begin_set_parameter(param);
+            ui.memory_mut(|mem| {
+                mem.data.insert_temp(memory.with("start"), normalized);
+                mem.data.insert_temp(memory.with("drag"), 0.0f32);
+                mem.data.insert_temp(memory.with("turning"), true);
+            });
+            turning = true;
+        }
+        if turning && response.dragged() {
+            let (start, mut dragged) = ui.memory(|mem| {
+                (
+                    mem.data
+                        .get_temp::<f32>(memory.with("start"))
+                        .unwrap_or(normalized),
+                    mem.data
+                        .get_temp::<f32>(memory.with("drag"))
+                        .unwrap_or(0.0),
+                )
+            });
+            dragged += -response.drag_delta().y;
+            ui.memory_mut(|mem| mem.data.insert_temp(memory.with("drag"), dragged));
+            let fine = ui.input(|input| input.modifiers.shift);
+            let scale = if fine { 0.0015 } else { 1.0 / 140.0 };
+            let next = (start + dragged * scale).clamp(0.0, 1.0);
+            setter.set_parameter(param, param.preview_plain(next));
+        }
+        if turning && response.drag_stopped() {
+            setter.end_set_parameter(param);
+            ui.memory_mut(|mem| mem.data.remove::<bool>(memory.with("turning")));
+        }
+        if response.dragged() {
+            ui.memory_mut(|mem| mem.data.insert_temp(memory.with("shown"), now));
+        }
     }
-    if turning && response.drag_stopped() {
-        setter.end_set_parameter(param);
-        ui.memory_mut(|mem| mem.data.remove::<bool>(memory.with("turning")));
+    if !pointer_down {
+        ui.memory_mut(|mem| mem.data.remove::<bool>(memory.with("suppress")));
+    }
+    ui.memory_mut(|mem| mem.data.insert_temp(memory.with("down"), pointer_down));
+    let mut show_reset = false;
+    let mut clear_reset = false;
+    if let Some(edit) = reset.as_mut() {
+        if edit.open {
+            show_reset = true;
+        } else {
+            let target = param.default_normalized_value();
+            let live = param.modulated_normalized_value();
+            if (live - target).abs() < 0.004 || edit.frames >= BOOL_SHOW_FRAMES {
+                clear_reset = true;
+            } else {
+                edit.frames = edit.frames.saturating_add(1);
+                show_reset = true;
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+    if clear_reset {
+        reset = None;
+    }
+    if let Some(edit) = reset {
+        ui.memory_mut(|mem| mem.data.insert_temp(memory.with("reset"), edit));
+    } else {
+        ui.memory_mut(|mem| mem.data.remove::<PendingReset>(memory.with("reset")));
+    }
+    normalized = if show_reset {
+        param.default_normalized_value()
+    } else {
+        param.modulated_normalized_value()
+    };
+    let readout = if show_reset {
+        param.normalized_value_to_string(param.default_normalized_value(), false)
+    } else {
+        param.to_string()
+    };
+    let shown = ui
+        .memory(|mem| mem.data.get_temp::<f64>(memory.with("shown")))
+        .unwrap_or(f64::NEG_INFINITY);
+    let now = ui.input(|input| input.time);
+    let value_visible = now - shown < VALUE_HOLD;
+    if value_visible {
+        let remaining = VALUE_HOLD - (now - shown);
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(remaining.max(0.05)));
     }
 
     let dial = 70.0_f32.min(rect.width() - 8.0);
@@ -598,21 +960,57 @@ fn draw_knob(ui: &mut egui::Ui, setter: &ParamSetter, param: &impl Param, name: 
     );
     painter.line_segment([inner, outer], Stroke::new(1.6_f32, DIAL_INK));
 
+    if value_visible {
+        painter.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            dial_readout(&readout),
+            egui::FontId::proportional(11.0),
+            DIAL_INK,
+        );
+    }
     painter.text(
-        egui::pos2(rect.center().x, rect.top() + dial + 14.0),
-        egui::Align2::CENTER_CENTER,
-        param.to_string(),
-        egui::FontId::proportional(13.0),
-        INK,
-    );
-    painter.text(
-        egui::pos2(rect.center().x, rect.top() + dial + 30.0),
+        egui::pos2(rect.center().x, rect.top() + dial + 12.0),
         egui::Align2::CENTER_CENTER,
         name.to_uppercase(),
         egui::FontId::proportional(11.0),
         STONE,
     );
+    if response.hovered() || response.dragged() {
+        if let Some(text) = knob_help(name) {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new("hyperchroma-knob-help"), text);
+            });
+        }
+    }
     let _ = response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
+}
+
+fn dial_readout(text: &str) -> String {
+    if text.eq_ignore_ascii_case("center") {
+        "C".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+fn knob_help(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Swell" => "Chance of swelling in reverse",
+        "Crush" => "Chance of getting bitcrushed at various rates and depths",
+        "Pass" => "Chance of being sent through a HP or LP filter at various frequencies",
+        "Stutter" => "Chance of repeating in place at various rates",
+        "Smear" => "Chance of being processed into overlapping, slightly detuned grains",
+        "Splatter" => "Chance of being processed into rhythmic, short grains",
+        "Wash" => "Chance of getting momentarily drenched in reverb",
+        "Drift" => "Chance of a note moving towards or away from the effects' set points",
+        "Luck" => "Chance of being played",
+        "Reverse" => "Chance of playing backward",
+        "Spread" => "Chance of getting panned left or right",
+        "Leap" => "Chance of playing an octave higher at 2x speed",
+        "Charm" => "Chance of being affected by global effects",
+        _ => return None,
+    })
 }
 
 fn arc_points(center: egui::Pos2, radius: f32, start: f32, end: f32) -> Vec<egui::Pos2> {
@@ -769,52 +1167,52 @@ fn settle_bool(
 
 fn color_label(name: &str) -> &'static str {
     match name {
-        "bug" => "Olive",
-        "dark" => "Slate",
-        "dragon" => "Rust",
-        "electric" => "Gold",
-        "fairy" => "Mauve",
-        "fighting" => "Brick",
-        "fire" => "Copper",
-        "flying" => "Azure",
-        "ghost" => "Purple",
-        "grass" => "Fern",
-        "ground" => "Ochre",
-        "ice" => "Teal",
-        "normal" => "Beige",
-        "poison" => "Plum",
-        "psychic" => "Rose",
-        "rock" => "Stone",
-        "steel" => "Gray",
-        "water" => "Blue",
-        "sage" => "Sage",
-        "clay" => "Clay",
+        "bug" => "Poppy",
+        "dark" => "Rosehip",
+        "dragon" => "Peony",
+        "electric" => "Apricot",
+        "fairy" => "Persimmon",
+        "fighting" => "Marigold",
+        "fire" => "Buttercup",
+        "flying" => "Lichen",
+        "ghost" => "Fern",
+        "grass" => "Pine",
+        "ground" => "Eucalyptus",
+        "ice" => "Juniper",
+        "normal" => "Cornflower",
+        "poison" => "Iris",
+        "psychic" => "Lavender",
+        "rock" => "Orchid",
+        "steel" => "Aubergine",
+        "water" => "Chestnut",
+        "sage" => "Birch",
+        "clay" => "Indigo",
         _ => "",
     }
 }
 
 fn tile_color(name: &str) -> Color32 {
     match name {
-        "bug" => Color32::from_rgb(92, 122, 64),
-        "dark" => Color32::from_rgb(62, 66, 88),
-        "dragon" => Color32::from_rgb(140, 84, 62),
-        "electric" => Color32::from_rgb(168, 146, 64),
-        "fairy" => Color32::from_rgb(156, 112, 138),
-        "fighting" => Color32::from_rgb(148, 78, 66),
-        "fire" => Color32::from_rgb(164, 96, 52),
-        "flying" => Color32::from_rgb(96, 132, 142),
-        "ghost" => Color32::from_rgb(112, 102, 146),
-        "grass" => Color32::from_rgb(70, 122, 78),
-        "ground" => Color32::from_rgb(132, 104, 68),
-        "ice" => Color32::from_rgb(92, 142, 148),
-        "normal" => Color32::from_rgb(128, 118, 96),
-        "poison" => Color32::from_rgb(118, 86, 140),
-        "psychic" => Color32::from_rgb(160, 96, 124),
-        "rock" => Color32::from_rgb(120, 110, 90),
-        "steel" => Color32::from_rgb(108, 124, 128),
-        "water" => Color32::from_rgb(64, 112, 140),
-        "sage" => Color32::from_rgb(134, 146, 114),
-        "clay" => Color32::from_rgb(176, 132, 108),
+        "bug" => Color32::from_rgb(0xc8, 0x46, 0x3d),
+        "dark" => Color32::from_rgb(0xb5, 0x41, 0x6f),
+        "dragon" => Color32::from_rgb(0xd9, 0x8b, 0xa8),
+        "electric" => Color32::from_rgb(0xe8, 0x94, 0x74),
+        "fairy" => Color32::from_rgb(0xd9, 0x69, 0x2e),
+        "fighting" => Color32::from_rgb(0xe3, 0xa7, 0x2f),
+        "fire" => Color32::from_rgb(0xe8, 0xd3, 0x5e),
+        "flying" => Color32::from_rgb(0xa2, 0xb4, 0x55),
+        "ghost" => Color32::from_rgb(0x4f, 0x8f, 0x45),
+        "grass" => Color32::from_rgb(0x2e, 0x5e, 0x4e),
+        "ground" => Color32::from_rgb(0x5f, 0xa5, 0x93),
+        "ice" => Color32::from_rgb(0x3a, 0x7e, 0x9e),
+        "normal" => Color32::from_rgb(0x4a, 0x8f, 0xdb),
+        "poison" => Color32::from_rgb(0x5b, 0x5b, 0xae),
+        "psychic" => Color32::from_rgb(0xb5, 0x9c, 0xdb),
+        "rock" => Color32::from_rgb(0xa1, 0x5b, 0xb0),
+        "steel" => Color32::from_rgb(0x5a, 0x34, 0x56),
+        "water" => Color32::from_rgb(0x8a, 0x4f, 0x2e),
+        "sage" => Color32::from_rgb(0xd8, 0xd2, 0xc0),
+        "clay" => Color32::from_rgb(0x2b, 0x3f, 0x78),
         _ => Color32::from_rgb(70, 96, 84),
     }
 }
@@ -825,4 +1223,159 @@ fn lighten(color: Color32, amount: u8) -> Color32 {
         color.g().saturating_add(amount),
         color.b().saturating_add(amount),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dial_readout;
+    use nih_plug_egui::egui;
+
+    #[test]
+    fn center_reads_as_c_inside_the_dial() {
+        assert_eq!(dial_readout("Center"), "C");
+        assert_eq!(dial_readout("center"), "C");
+        assert_eq!(dial_readout("50%"), "50%");
+        assert_eq!(dial_readout("L 20%"), "L 20%");
+    }
+
+    #[test]
+    fn manrope_is_the_ui_font() {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput::default();
+        let _ = ctx.run(raw, |ctx| {
+            super::install_manrope(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Hyperchroma 100%");
+            });
+        });
+        let raw = egui::RawInput::default();
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Hyperchroma 100%");
+            });
+        });
+    }
+
+    #[test]
+    fn double_click_resets_a_knob_and_keeps_the_edit_open() {
+        use nih_plug::prelude::{
+            FloatParam, FloatRange, GuiContext, ParamPtr, ParamSetter, PluginApi, PluginState,
+        };
+        use std::sync::Mutex;
+
+        struct Log {
+            events: Mutex<Vec<&'static str>>,
+            values: Mutex<Vec<f32>>,
+        }
+
+        impl GuiContext for Log {
+            fn plugin_api(&self) -> PluginApi {
+                PluginApi::Vst3
+            }
+            fn request_resize(&self) -> bool {
+                false
+            }
+            unsafe fn raw_begin_set_parameter(&self, _: ParamPtr) {
+                self.events.lock().unwrap().push("begin");
+            }
+            unsafe fn raw_set_parameter_normalized(&self, _: ParamPtr, normalized: f32) {
+                self.events.lock().unwrap().push("set");
+                self.values.lock().unwrap().push(normalized);
+            }
+            unsafe fn raw_end_set_parameter(&self, _: ParamPtr) {
+                self.events.lock().unwrap().push("end");
+            }
+            fn get_state(&self) -> PluginState {
+                PluginState {
+                    version: String::new(),
+                    params: Default::default(),
+                    fields: Default::default(),
+                }
+            }
+            fn set_state(&self, _: PluginState) {}
+        }
+
+        let param = FloatParam::new(
+            "Swell",
+            0.0,
+            FloatRange::Linear { min: 0.0, max: 1.0 },
+        );
+        let log = Log {
+            events: Mutex::new(Vec::new()),
+            values: Mutex::new(Vec::new()),
+        };
+        let setter = ParamSetter::new(&log);
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(200.0, 40.0);
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut time = 0.0f64;
+        let mut frame = |events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 300.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            time += 0.05;
+            let _ = ctx.run(raw, |ctx| {
+                super::theme(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let slot = egui::Rect::from_min_size(
+                        egui::pos2(0.0, 0.0),
+                        egui::vec2(400.0, super::KNOB_SLOT),
+                    );
+                    let builder = egui::UiBuilder::new()
+                        .id_salt(("Swell", "global"))
+                        .max_rect(slot)
+                        .layout(egui::Layout::top_down(egui::Align::Center));
+                    ui.allocate_new_ui(builder, |ui| {
+                        super::draw_knob(ui, &setter, &param, "Swell", false);
+                    });
+                });
+            });
+        };
+
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        frame(vec![click(true)]);
+        frame(vec![click(false)]);
+        assert!(
+            log.events.lock().unwrap().is_empty(),
+            "one click should leave the knob where it is"
+        );
+        frame(vec![click(true)]);
+        let events = log.events.lock().unwrap().clone();
+        let values = log.values.lock().unwrap().clone();
+        assert!(
+            events.contains(&"begin") && events.contains(&"set") && !events.contains(&"end"),
+            "the reset has to stay open past this frame, got {events:?}"
+        );
+        assert!(
+            values.iter().any(|value| *value < 0.001),
+            "the reset should send the default, got {values:?}"
+        );
+        for _ in 0..4 {
+            frame(vec![]);
+        }
+        assert!(
+            !log.events.lock().unwrap().contains(&"end"),
+            "Cubase drops an edit that ends within a few frames of the begin"
+        );
+        for _ in 0..8 {
+            frame(vec![]);
+        }
+        let events = log.events.lock().unwrap().clone();
+        assert!(
+            events.contains(&"end") && events.iter().filter(|event| **event == "begin").count()
+                == events.iter().filter(|event| **event == "end").count(),
+            "the reset gesture should close once, got {events:?}"
+        );
+    }
 }

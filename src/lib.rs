@@ -76,6 +76,9 @@ pub struct SliceParams {
 
     #[id = "oct"]
     pub octave: FloatParam,
+
+    #[id = "charm"]
+    pub charm: FloatParam,
 }
 
 impl SliceParams {
@@ -95,6 +98,7 @@ impl SliceParams {
             .with_value_to_string(Arc::new(pan_text))
             .with_string_to_value(Arc::new(pan_parse)),
             octave: percent_param("Leap", 0.0),
+            charm: percent_param("Charm", 0.5),
         }
     }
 }
@@ -170,7 +174,7 @@ fn pan_parse(text: &str) -> Option<f32> {
 
 #[derive(Params)]
 pub struct HyperchromaParams {
-    #[persist = "editor-state-3"]
+    #[persist = "editor-state-8"]
     editor_state: Arc<EguiState>,
 
     #[id = "gain"]
@@ -212,45 +216,54 @@ pub struct HyperchromaParams {
     #[id = "smear"]
     pub smear: FloatParam,
 
-    #[nested(id_prefix = "bug", group = "Bug")]
+    #[id = "splatter"]
+    pub splatter: FloatParam,
+
+    #[id = "escape"]
+    pub escape: FloatParam,
+
+    #[id = "drift"]
+    pub drift: FloatParam,
+
+    #[nested(id_prefix = "bug", group = "Poppy")]
     pub bug: SliceParams,
-    #[nested(id_prefix = "dark", group = "Dark")]
+    #[nested(id_prefix = "dark", group = "Rosehip")]
     pub dark: SliceParams,
-    #[nested(id_prefix = "dragon", group = "Dragon")]
+    #[nested(id_prefix = "dragon", group = "Peony")]
     pub dragon: SliceParams,
-    #[nested(id_prefix = "electric", group = "Electric")]
+    #[nested(id_prefix = "electric", group = "Apricot")]
     pub electric: SliceParams,
-    #[nested(id_prefix = "fairy", group = "Fairy")]
+    #[nested(id_prefix = "fairy", group = "Persimmon")]
     pub fairy: SliceParams,
-    #[nested(id_prefix = "fighting", group = "Fighting")]
+    #[nested(id_prefix = "fighting", group = "Marigold")]
     pub fighting: SliceParams,
-    #[nested(id_prefix = "fire", group = "Fire")]
+    #[nested(id_prefix = "fire", group = "Buttercup")]
     pub fire: SliceParams,
-    #[nested(id_prefix = "flying", group = "Flying")]
+    #[nested(id_prefix = "flying", group = "Lichen")]
     pub flying: SliceParams,
-    #[nested(id_prefix = "ghost", group = "Ghost")]
+    #[nested(id_prefix = "ghost", group = "Fern")]
     pub ghost: SliceParams,
-    #[nested(id_prefix = "grass", group = "Grass")]
+    #[nested(id_prefix = "grass", group = "Pine")]
     pub grass: SliceParams,
-    #[nested(id_prefix = "ground", group = "Ground")]
+    #[nested(id_prefix = "ground", group = "Eucalyptus")]
     pub ground: SliceParams,
-    #[nested(id_prefix = "ice", group = "Ice")]
+    #[nested(id_prefix = "ice", group = "Juniper")]
     pub ice: SliceParams,
-    #[nested(id_prefix = "normal", group = "Normal")]
+    #[nested(id_prefix = "normal", group = "Cornflower")]
     pub normal: SliceParams,
-    #[nested(id_prefix = "poison", group = "Poison")]
+    #[nested(id_prefix = "poison", group = "Iris")]
     pub poison: SliceParams,
-    #[nested(id_prefix = "psychic", group = "Psychic")]
+    #[nested(id_prefix = "psychic", group = "Lavender")]
     pub psychic: SliceParams,
-    #[nested(id_prefix = "rock", group = "Rock")]
+    #[nested(id_prefix = "rock", group = "Orchid")]
     pub rock: SliceParams,
-    #[nested(id_prefix = "steel", group = "Steel")]
+    #[nested(id_prefix = "steel", group = "Aubergine")]
     pub steel: SliceParams,
-    #[nested(id_prefix = "water", group = "Water")]
+    #[nested(id_prefix = "water", group = "Chestnut")]
     pub water: SliceParams,
-    #[nested(id_prefix = "sage", group = "Sage")]
+    #[nested(id_prefix = "sage", group = "Birch")]
     pub sage: SliceParams,
-    #[nested(id_prefix = "clay", group = "Clay")]
+    #[nested(id_prefix = "clay", group = "Indigo")]
     pub clay: SliceParams,
 }
 
@@ -304,7 +317,10 @@ impl Default for Hyperchroma {
 impl Default for HyperchromaParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(1100, 900),
+            editor_state: EguiState::from_size(
+                editor::WINDOW_COLLAPSED.0,
+                editor::WINDOW_COLLAPSED.1,
+            ),
             gain: FloatParam::new(
                 "Gain",
                 -6.0,
@@ -368,6 +384,9 @@ impl Default for HyperchromaParams {
             pass: percent_param("Pass", 0.0),
             stutter: percent_param("Stutter", 0.0),
             smear: percent_param("Smear", 0.0),
+            splatter: percent_param("Splatter", 0.0),
+            escape: percent_param("Wash", 0.0),
+            drift: percent_param("Drift", 0.0),
             bug: SliceParams::new(),
             dark: SliceParams::new(),
             dragon: SliceParams::new(),
@@ -424,7 +443,7 @@ impl Plugin for Hyperchroma {
             KbState::new(),
             |ctx, _| editor::theme(ctx),
             move |ctx, setter, kb| {
-                editor::draw(ctx, setter, kb, &params, &shared, egui_state.as_ref());
+                editor::draw(ctx, setter, kb, &params, &shared, &egui_state);
             },
         )
     }
@@ -503,6 +522,9 @@ impl Plugin for Hyperchroma {
             pass: self.params.pass.value(),
             stutter: self.params.stutter.value(),
             smear: self.params.smear.value(),
+            splatter: self.params.splatter.value(),
+            escape: self.params.escape.value(),
+            drift: self.params.drift.value(),
         });
         self.poll_preview(buffer.samples());
 
@@ -663,6 +685,7 @@ impl Hyperchroma {
                         reverse: slice.reverse.value(),
                         pan: slice.pan.value(),
                         octave: slice.octave.value(),
+                        charm: slice.charm.value(),
                     };
                 }
                 None => weights[index] = 1.0,
