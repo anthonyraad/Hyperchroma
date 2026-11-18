@@ -206,6 +206,9 @@ pub struct HyperchromaParams {
     #[id = "keytrack"]
     pub keytrack: BoolParam,
 
+    #[id = "stereoentropic"]
+    pub stereoentropic: BoolParam,
+
     #[id = "tempo"]
     pub tempo: FloatParam,
 
@@ -242,6 +245,10 @@ pub struct HyperchromaParams {
     /// Chance a color plays its B-side. `0` is always A, `1` is always B, in 5% steps.
     #[id = "bside"]
     pub b_side: FloatParam,
+
+    /// Reverse chance for colors whose Reverse knob is still at zero, in 5% steps.
+    #[id = "revfloor"]
+    pub reverse_floor: FloatParam,
 
     #[nested(id_prefix = "bug", group = "Poppy")]
     pub bug: SliceParams,
@@ -393,6 +400,7 @@ impl Default for HyperchromaParams {
                 .with_value_to_string(Arc::new(|value| note_name(value)))
                 .with_string_to_value(Arc::new(|text| parse_note(text))),
             keytrack: BoolParam::new("Keytracking", false),
+            stereoentropic: BoolParam::new("Stereoentropic", false),
             tempo: FloatParam::new(
                 "Tempo",
                 120.0,
@@ -424,6 +432,17 @@ impl Default for HyperchromaParams {
             drift: percent_param("Drift", 0.0),
             b_side: FloatParam::new(
                 "B-side",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                },
+            )
+            .with_step_size(0.05)
+            .with_value_to_string(Arc::new(percent_text))
+            .with_string_to_value(Arc::new(percent_parse)),
+            reverse_floor: FloatParam::new(
+                "Reverse floor",
                 0.0,
                 FloatRange::Linear {
                     min: 0.0,
@@ -588,6 +607,8 @@ impl Plugin for Hyperchroma {
             escape: self.params.escape.value(),
             drift: self.params.drift.value(),
             b_side: self.params.b_side.value(),
+            stereoentropic: self.params.stereoentropic.value(),
+            reverse_floor: self.params.reverse_floor.value(),
         });
         self.poll_preview(buffer.samples());
 

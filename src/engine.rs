@@ -54,13 +54,6 @@ impl Grain {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PanSide {
-    Center,
-    Left,
-    Right,
-}
-
 /// Chances that apply to every note, decided once when the note starts.
 #[derive(Clone, Copy)]
 pub struct GlobalRoll {
@@ -82,6 +75,10 @@ pub struct GlobalRoll {
     pub drift: f32,
     /// Chance the chosen color plays its B-side. `0` is always A, `1` is always B.
     pub b_side: f32,
+    /// When on, colors with Spread at Center pick a random stereo position per note.
+    pub stereoentropic: bool,
+    /// Reverse chance used only when a color's Reverse knob is at zero.
+    pub reverse_floor: f32,
 }
 
 impl GlobalRoll {
@@ -96,6 +93,8 @@ impl GlobalRoll {
             escape: 0.0,
             drift: 0.0,
             b_side: 0.0,
+            stereoentropic: false,
+            reverse_floor: 0.0,
         }
     }
 }
@@ -146,7 +145,11 @@ struct Voice {
     serial: u32,
     until_next: usize,
     reverse: bool,
-    pan: PanSide,
+    /// Stereo placement for the note, `-1` hard left to `1` hard right. `0` keeps the recording.
+    pan: f32,
+    /// Where this note's stereo started, and where Drift walks it.
+    pan_from: f32,
+    pan_to: f32,
     octave_up: bool,
     crush: bool,
     crush_steps: f32,
@@ -233,7 +236,9 @@ impl Voice {
             serial: 0,
             until_next: 0,
             reverse: false,
-            pan: PanSide::Center,
+            pan: 0.0,
+            pan_from: 0.0,
+            pan_to: 0.0,
             octave_up: false,
             crush: false,
             crush_steps: 32.0,
@@ -506,8 +511,17 @@ impl Engine {
             None => self.rng.unit() as f64 * frames,
         };
         let roll = rolls.get(sample_index).copied().unwrap_or(SliceRolls::neutral());
-        let mut reverse = self.rng.unit() < roll.reverse.clamp(0.0, 1.0);
-        let pan = rolled_pan(&mut self.rng, roll.pan);
+        let reverse_chance = if roll.reverse.abs() < 0.005 {
+            self.global.reverse_floor
+        } else {
+            roll.reverse
+        };
+        let mut reverse = self.rng.unit() < reverse_chance.clamp(0.0, 1.0);
+        let pan = if self.global.stereoentropic && roll.pan.abs() < 0.005 {
+            self.rng.unit() * 2.0 - 1.0
+        } else {
+            rolled_pan(&mut self.rng, roll.pan)
+        };
         let octave_up = self.rng.unit() < roll.octave.clamp(0.0, 1.0);
         let charm = if roll.charm.is_finite() {
             roll.charm.clamp(0.0, 1.0)
@@ -746,6 +760,18 @@ impl Engine {
         } else if swell {
             attack_samples = attack_samples.max(self.sample_rate * SWELL_SECONDS);
         }
+        // Stereo only walks when the note already has a seat: Spread off center, or
+        // Stereoentropic (which gives a centered Spread a random start).
+        let pan_drifts = drift && (roll.pan.abs() >= 0.005 || self.global.stereoentropic);
+        let pan_to = if pan_drifts {
+            if self.rng.unit() < 0.5 {
+                -1.0
+            } else {
+                1.0
+            }
+        } else {
+            pan
+        };
 
         let slot = self.allocate_voice();
         let serial = self.next_serial;
@@ -762,6 +788,8 @@ impl Engine {
         voice.until_next = 0;
         voice.reverse = reverse;
         voice.pan = pan;
+        voice.pan_from = pan;
+        voice.pan_to = pan_to;
         voice.octave_up = octave_up;
         voice.crush = crush_on;
         voice.crush_steps = crush_steps;
@@ -1203,7 +1231,7 @@ impl Engine {
         schedule: f32,
         sr_ratio: f64,
         direction: f64,
-        pan: PanSide,
+        pan: f32,
     ) -> (f32, f32) {
         playhead = (playhead + schedule as f64 * sr_ratio * direction).rem_euclid(frames);
         let (left, right) = self.smear_sum(index, sample_index, frames, read_inc, playhead);
@@ -1302,7 +1330,7 @@ impl Engine {
         (left, right)
     }
 
-    fn finish_voice(&mut self, index: usize, left: f32, right: f32, pan: PanSide) -> (f32, f32) {
+    fn finish_voice(&mut self, index: usize, left: f32, right: f32, pan: f32) -> (f32, f32) {
         let (left, right) = place(left, right, pan);
         let (left, right) = self.color_voice(index, left, right);
         let stutter_amount = effect_amount(&self.voices[index], self.voices[index].dest_stutter);
@@ -1492,6 +1520,9 @@ impl Engine {
         } else {
             1.0 - eased
         };
+        if (voice.pan_from - voice.pan_to).abs() > 1.0e-4 {
+            voice.pan = voice.pan_from + (voice.pan_to - voice.pan_from) * eased;
+        }
         if voice.dest_crush > 0.0 {
             let amount = (voice.dest_crush * voice.drift_now).clamp(0.0, 1.0);
             voice.crush = amount > 0.035;
@@ -1723,14 +1754,14 @@ impl Engine {
     }
 }
 
-fn rolled_pan(rng: &mut Rng, pan: f32) -> PanSide {
+fn rolled_pan(rng: &mut Rng, pan: f32) -> f32 {
     let pan = pan.clamp(-1.0, 1.0);
     if pan < 0.0 && rng.unit() < -pan {
-        PanSide::Left
+        -1.0
     } else if pan > 0.0 && rng.unit() < pan {
-        PanSide::Right
+        1.0
     } else {
-        PanSide::Center
+        0.0
     }
 }
 
@@ -1742,12 +1773,19 @@ fn finite_sample(sample: f32) -> f32 {
     }
 }
 
-fn place(left: f32, right: f32, pan: PanSide) -> (f32, f32) {
-    match pan {
-        PanSide::Center => (left, right),
-        PanSide::Left => (0.5 * (left + right), 0.0),
-        PanSide::Right => (0.0, 0.5 * (left + right)),
+fn place(left: f32, right: f32, pan: f32) -> (f32, f32) {
+    let pan = if pan.is_finite() {
+        pan.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
+    if pan.abs() < 1.0e-4 {
+        return (left, right);
     }
+    let mid = 0.5 * (left + right);
+    // Constant-power: -1 all left, 1 all right. Matches the old hard L/R at the extremes.
+    let angle = (pan + 1.0) * std::f32::consts::FRAC_PI_4;
+    (mid * angle.cos(), mid * angle.sin())
 }
 
 /// How long a swell takes to rise from silence, in seconds.

@@ -16,6 +16,7 @@ const CREAM: Color32 = Color32::from_rgb(239, 231, 214);
 const STONE: Color32 = Color32::from_rgb(120, 112, 100);
 const PAPER: Color32 = Color32::from_rgb(245, 240, 230);
 const POLLEN: Color32 = Color32::from_rgb(224, 186, 122);
+const LAVENDER: Color32 = Color32::from_rgb(186, 168, 214);
 const WARN: Color32 = Color32::from_rgb(214, 148, 110);
 
 /// Sound boxes are 15% narrower than the 117.6px boxes the 670px window used.
@@ -39,7 +40,7 @@ const WINDOW_EXPANDED: (u32, u32) = (1166, 510);
 
 pub struct KbState {
     settings_open: bool,
-    /// The right-hand controls and the settings gear. The editor opens folded.
+    /// The right-hand controls and the settings mark. The editor opens folded.
     controls_open: bool,
     /// Window size to restore the next time the controls fold out.
     expanded_size: (u32, u32),
@@ -52,6 +53,8 @@ pub struct KbState {
     selected: Option<usize>,
     /// Keytracking edit the host has not applied yet.
     keytrack_edit: Option<PendingBool>,
+    /// Stereoentropic edit the host has not applied yet.
+    stereoentropic_edit: Option<PendingBool>,
     /// Follow-host-tempo edit the host has not applied yet.
     sync_edit: Option<PendingBool>,
 }
@@ -66,6 +69,7 @@ impl KbState {
             fold_synced: false,
             selected: None,
             keytrack_edit: None,
+            stereoentropic_edit: None,
             sync_edit: None,
         }
     }
@@ -145,6 +149,12 @@ pub fn draw(
             } else {
                 // A click can close the panel before the host has taken the edit.
                 settle_bool(setter, &params.keytrack, &mut kb.keytrack_edit, None);
+                settle_bool(
+                    setter,
+                    &params.stereoentropic,
+                    &mut kb.stereoentropic_edit,
+                    None,
+                );
                 settle_bool(setter, &params.sync, &mut kb.sync_edit, None);
             }
             if empty.clicked() {
@@ -257,7 +267,7 @@ fn header(ui: &mut egui::Ui, kb: &mut KbState, egui_state: &Arc<EguiState>, show
                 .max_rect(gear)
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
             |ui| {
-                if gear_button(ui, kb.settings_open).clicked() {
+                if settings_button(ui, kb.settings_open).clicked() {
                     kb.settings_open = !kb.settings_open;
                 }
             },
@@ -280,50 +290,52 @@ fn toggle_controls(kb: &mut KbState, egui_state: &EguiState) {
     }
 }
 
-/// `>>` folds the controls out, `<<` folds them away. Ink on the paper, no fill.
+/// `>>` folds the controls out, `<<` folds them away.
 /// The two carets are drawn separately so they can sit closer than the font's pair.
+/// Same ink as the settings mark: stone at rest, ink when hovered or while the controls are out.
 fn fold_button(ui: &mut egui::Ui, expand: bool) -> egui::Response {
     let mark = if expand { ">" } else { "<" };
     let font = egui::FontId::proportional(20.0);
-    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(mark.to_owned(), font, INK));
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(mark.to_owned(), font.clone(), INK));
     let advance = galley.size().x;
     let step = advance * 0.64;
     let total = advance + step;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(total + 4.0, 28.0), egui::Sense::click());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(total + 4.0, 28.0), egui::Sense::click());
+    let color = mark_color(!expand, response.hovered());
+    let painted = ui.fonts(|fonts| fonts.layout_no_wrap(mark.to_owned(), font, color));
     let left = rect.center().x - total * 0.5;
-    let top = rect.center().y - galley.size().y * 0.5;
-    ui.painter().galley(egui::pos2(left, top), galley.clone(), INK);
-    ui.painter().galley(egui::pos2(left + step, top), galley, INK);
+    let top = rect.center().y - painted.size().y * 0.5;
+    ui.painter().galley(egui::pos2(left, top), painted.clone(), color);
+    ui.painter()
+        .galley(egui::pos2(left + step, top), painted, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn gear_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
+fn settings_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), egui::Sense::click());
-    let color = if open || response.hovered() { INK } else { STONE };
+    let color = mark_color(open, response.hovered());
     if open {
-        ui.painter().circle_filled(
-            rect.center(),
-            13.0,
-            Color32::from_rgba_unmultiplied(224, 186, 122, 28),
-        );
+        paint_open_mark(ui.painter(), rect.center());
     }
-    paint_gear(ui.painter(), rect.center(), 7.2, color);
+    let galley = ui.fonts(|fonts| {
+        fonts.layout_no_wrap("&".to_owned(), egui::FontId::proportional(20.0), color)
+    });
+    let pos = rect.center() - galley.size() * 0.5;
+    ui.painter().galley(pos, galley, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn paint_gear(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Color32) {
-    let stroke = Stroke::new(1.45_f32, color);
-    painter.circle_stroke(center, radius * 0.46, stroke);
-    painter.circle_filled(center, radius * 0.16, color);
-    for tooth in 0..6 {
-        let angle =
-            tooth as f32 * std::f32::consts::TAU / 6.0 - std::f32::consts::FRAC_PI_2;
-        let dir = egui::vec2(angle.cos(), angle.sin());
-        painter.line_segment(
-            [center + dir * (radius * 0.58), center + dir * radius],
-            stroke,
-        );
-    }
+fn mark_color(open: bool, hovered: bool) -> Color32 {
+    if open || hovered { INK } else { STONE }
+}
+
+fn paint_open_mark(painter: &egui::Painter, center: egui::Pos2) {
+    painter.circle_filled(
+        center,
+        13.0,
+        Color32::from_rgba_unmultiplied(224, 186, 122, 28),
+    );
 }
 
 fn recordings(
@@ -1081,7 +1093,7 @@ fn knob_help(name: &str) -> Option<&'static str> {
         "Smear" => "Chance of being processed into overlapping, slightly detuned grains",
         "Splatter" => "Chance of being thinned until only the strongest partials remain",
         "Wash" => "Chance of getting momentarily drenched in reverb",
-        "Drift" => "Chance of a note moving towards or away from the effects' set points",
+        "Drift" => "Chance of a note moving towards or away from the effects, and of its stereo seat drifting left or right",
         "Luck" => "Chance of being played",
         "Reverse" => "Chance of playing backward",
         "Spread" => "Chance of getting panned left or right",
@@ -1133,17 +1145,66 @@ fn shaping(
         track_clicked.then_some(track),
     );
 
+    let mut entropy = kb
+        .stereoentropic_edit
+        .map(|edit| edit.target)
+        .unwrap_or_else(|| params.stereoentropic.value());
+    let entropy_clicked = ui.checkbox(&mut entropy, "Stereoentropic").changed();
+    settle_bool(
+        setter,
+        &params.stereoentropic,
+        &mut kb.stereoentropic_edit,
+        entropy_clicked.then_some(entropy),
+    );
+
     ui.add_space(10.0);
+    let caption_w = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(
+                "Reverse floor".to_owned(),
+                egui::FontId::proportional(12.0),
+                STONE,
+            )
+            .size()
+            .x
+    });
+    const SLIDER_W: f32 = 220.0;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("A-side").size(12.0).color(STONE));
+        slider_caption(ui, "A-side", caption_w);
         ui.visuals_mut().selection.bg_fill = Color32::from_rgb(0xb4, 0xcc, 0xd8);
         ui.add(
             widgets::ParamSlider::for_param(&params.b_side, setter)
-                .with_width(220.0)
+                .with_width(SLIDER_W)
                 .without_value(),
         );
         ui.label(RichText::new("B-side").size(12.0).color(STONE));
     });
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        slider_caption(ui, "Reverse floor", caption_w);
+        ui.visuals_mut().selection.bg_fill = LAVENDER;
+        ui.add(
+            widgets::ParamSlider::for_param(&params.reverse_floor, setter).with_width(SLIDER_W),
+        );
+    });
+}
+
+/// Left caption for a settings slider. The slot is wide enough for the longest
+/// caption and the text sits on its right edge, so the tracks share a start.
+fn slider_caption(ui: &mut egui::Ui, text: &str, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Sense::hover(),
+    );
+    ui.allocate_new_ui(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        |ui| {
+            ui.label(RichText::new(text).size(12.0).color(STONE));
+        },
+    );
 }
 
 fn knob(ui: &mut egui::Ui, setter: &ParamSetter, label: &str, param: &impl Param) {
