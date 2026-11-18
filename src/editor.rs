@@ -25,7 +25,7 @@ const TILE_W_BEFORE: f32 = (636.0 - 12.0 * 4.0) / 5.0;
 const TILE_W: f32 = TILE_W_BEFORE * 0.85;
 const TILE_H: f32 = TILE_W_BEFORE * 0.82;
 const TILE_GAP: f32 = 12.0;
-const GRID_W: f32 = TILE_W * 5.0 + TILE_GAP * 4.0;
+const GRID_W: f32 = TILE_W * 6.0 + TILE_GAP * 5.0;
 /// The knob column, 15% narrower than the 522px column of the 1220px window.
 const CONTROLS_W: f32 = 522.0 * 0.85;
 const COLUMN_GAP: f32 = 28.0;
@@ -34,8 +34,8 @@ const MARGIN_R: i8 = 16;
 const MARGIN_T: i8 = 6;
 const MARGIN_B: i8 = 6;
 
-pub const WINDOW_COLLAPSED: (u32, u32) = (582, 510);
-const WINDOW_EXPANDED: (u32, u32) = (1054, 510);
+pub const WINDOW_COLLAPSED: (u32, u32) = (694, 510);
+const WINDOW_EXPANDED: (u32, u32) = (1166, 510);
 
 pub struct KbState {
     settings_open: bool,
@@ -45,6 +45,8 @@ pub struct KbState {
     expanded_size: (u32, u32),
     /// Applied on the next frame, before layout, so the host and the grid agree.
     pending_resize: Option<(u32, u32)>,
+    /// Host size has been matched to `controls_open` once for this editor session.
+    fold_synced: bool,
     /// Index into `SAMPLE_NAMES` whose knobs are open. `None` until a box is clicked.
     /// A click on empty paper clears it.
     selected: Option<usize>,
@@ -61,6 +63,7 @@ impl KbState {
             controls_open: false,
             expanded_size: WINDOW_EXPANDED,
             pending_resize: None,
+            fold_synced: false,
             selected: None,
             keytrack_edit: None,
             sync_edit: None,
@@ -77,6 +80,21 @@ pub fn draw(
     egui_state: &Arc<EguiState>,
 ) {
     theme(ctx);
+    // The host restores the last window size, but KbState always starts folded.
+    // Match once on open so a wide project editor shows its knobs. Do not keep
+    // re-reading size after that, or a collapse still looks wide for a frame and
+    // the next expand click is eaten as another collapse.
+    if !kb.fold_synced {
+        kb.fold_synced = true;
+        let size = egui_state.size();
+        if size.0 > WINDOW_COLLAPSED.0 + 40 {
+            kb.controls_open = true;
+            kb.expanded_size = (
+                size.0.max(WINDOW_EXPANDED.0),
+                size.1.max(WINDOW_EXPANDED.1),
+            );
+        }
+    }
     if let Some(size) = kb.pending_resize.take() {
         request_window_size(egui_state, setter, ctx, size);
     }
@@ -123,7 +141,7 @@ pub fn draw(
                 data.remove::<&'static str>(egui::Id::new("hyperchroma-knob-help"));
             });
             if kb.controls_open && kb.settings_open {
-                settings_panel(ui.ctx(), setter, kb, params, shared, &snap);
+                settings_panel(ui.ctx(), setter, kb, params, &snap);
             } else {
                 // A click can close the panel before the host has taken the edit.
                 settle_bool(setter, &params.keytrack, &mut kb.keytrack_edit, None);
@@ -347,9 +365,14 @@ fn color_grid(
     shared: &SharedUi,
     snap: &crate::BankSnapshot,
 ) {
-    const COLS: usize = 5;
+    const COLS: usize = 6;
     const ROWS: usize = 4;
     let mask = shared.active_mask.load(Ordering::Relaxed);
+    let b_mask = shared.b_side_mask.load(Ordering::Relaxed);
+    if mask != 0 {
+        ui.ctx().request_repaint();
+    }
+    let time = ui.input(|input| input.time);
     ui.set_width(GRID_W);
     ui.spacing_mut().item_spacing = egui::vec2(TILE_GAP, TILE_GAP);
     let tile_size = egui::vec2(TILE_W, TILE_H);
@@ -363,7 +386,24 @@ fn color_grid(
                 let playing = bank_index
                     .map(|slot| slot < 32 && mask & (1 << slot) != 0)
                     .unwrap_or(false);
+                let side_b = bank_index
+                    .map(|slot| slot < 32 && b_mask & (1 << slot) != 0)
+                    .unwrap_or(false);
                 let playhead = bank_index.and_then(|slot| playhead_of(shared, slot));
+                let weather = bank_index
+                    .filter(|_| playing)
+                    .and_then(|slot| weather_of(shared, slot))
+                    .unwrap_or(0.0);
+                let wave = info.map(|info| {
+                    if side_b {
+                        match (info.wave_min_b.as_ref(), info.wave_max_b.as_ref()) {
+                            (Some(mins), Some(maxs)) => (mins.as_ref(), maxs.as_ref()),
+                            _ => (info.wave_min.as_ref(), info.wave_max.as_ref()),
+                        }
+                    } else {
+                        (info.wave_min.as_ref(), info.wave_max.as_ref())
+                    }
+                });
                 let index = row * COLS + col;
                 let clicked = tile(
                     ui,
@@ -372,8 +412,12 @@ fn color_grid(
                     playing,
                     info.is_some(),
                     kb.selected == Some(index),
-                    info.map(|info| (info.wave_min.as_ref(), info.wave_max.as_ref())),
+                    wave,
                     playhead.filter(|_| playing),
+                    weather,
+                    time,
+                    index as f32,
+                    side_b,
                 );
                 if clicked {
                     kb.selected = if kb.selected == Some(index) {
@@ -396,9 +440,13 @@ fn tile(
     selected: bool,
     wave: Option<(&[f32], &[f32])>,
     playhead: Option<f32>,
+    weather: f32,
+    time: f64,
+    seed: f32,
+    side_b: bool,
 ) -> bool {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let radius = 4.0;
+    let radius = 1.5;
     let base = tile_color(name);
     let fill = if !loaded {
         Color32::from_rgb(28, 34, 32)
@@ -416,7 +464,8 @@ fn tile(
         if playing {
             if let (Some((mins, maxs)), Some(playhead)) = (wave, playhead) {
                 let plot = rect.shrink2(egui::vec2(12.0, rect.height() * 0.16));
-                paint_live_wave(&painter, plot, mins, maxs, playhead);
+                let ink = if side_b { Color32::BLACK } else { Color32::WHITE };
+                paint_live_wave(&painter, plot, mins, maxs, playhead, weather, time, seed, ink);
             }
             painter.rect_stroke(
                 rect,
@@ -449,18 +498,16 @@ fn settings_panel(
     setter: &ParamSetter,
     kb: &mut KbState,
     params: &HyperchromaParams,
-    shared: &SharedUi,
     snap: &crate::BankSnapshot,
 ) {
-    let max_h = (ctx.screen_rect().height() - 78.0).max(240.0);
     egui::Window::new("hyperchroma-settings")
+        // New id so the taller pre-trim size is not reused from egui memory.
+        .id(egui::Id::new("hyperchroma-settings-shape"))
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-(MARGIN_R as f32), 50.0))
-        .default_width(440.0)
-        .max_height(max_h)
-        .vscroll(true)
+        .auto_sized()
         .frame(
             egui::Frame::new()
                 .fill(PAPER)
@@ -475,7 +522,7 @@ fn settings_panel(
                 }),
         )
         .show(ctx, |ui| {
-            ui.set_min_width(400.0);
+            ui.set_min_width(360.0);
             let visuals = ui.visuals_mut();
             visuals.override_text_color = Some(INK);
             for widget in [
@@ -490,7 +537,7 @@ fn settings_panel(
             visuals.widgets.hovered.bg_fill = Color32::from_rgb(222, 214, 200);
             visuals.widgets.active.bg_fill = Color32::from_rgb(210, 200, 184);
             visuals.extreme_bg_color = Color32::from_rgb(232, 226, 214);
-            shaping(ui, setter, kb, params, shared);
+            shaping(ui, setter, kb, params);
             let loaded = SAMPLE_NAMES
                 .iter()
                 .filter(|name| snap.infos.iter().any(|info| info.name == **name))
@@ -528,13 +575,24 @@ fn playhead_of(shared: &SharedUi, slot: usize) -> Option<f32> {
     }
 }
 
+fn weather_of(shared: &SharedUi, slot: usize) -> Option<f32> {
+    let ppm = shared.weather_ppm.get(slot)?.load(Ordering::Relaxed);
+    Some((ppm as f32 / 1_000_000.0).clamp(0.0, 1.0))
+}
+
 /// A solid white picture of the recording, with a white line at the playhead.
+/// `weather` stirs the silhouette when a global effect is on the note; with Drift it
+/// grows or settles with the note instead of snapping.
 fn paint_live_wave(
     painter: &egui::Painter,
     rect: egui::Rect,
     mins: &[f32],
     maxs: &[f32],
     playhead: f32,
+    weather: f32,
+    time: f64,
+    seed: f32,
+    ink: Color32,
 ) {
     let bins = mins.len().min(maxs.len());
     if bins < 4 || rect.width() < 8.0 || rect.height() < 8.0 {
@@ -544,13 +602,15 @@ fn paint_live_wave(
     let columns = (rect.width() / 2.2).round().clamp(48.0, 180.0) as usize;
     let mid_y = rect.center().y;
     let amp = rect.height() * 0.48;
-    let white = Color32::WHITE;
+    let weather = weather.clamp(0.0, 1.0);
+    let weather = weather * weather * (3.0 - 2.0 * weather);
+    let phase = time as f32 * (1.55 + weather * 1.35) + seed * 1.73;
 
     let mut mesh = Mesh::default();
     for col in 0..columns {
         let t = col as f32 / (columns - 1) as f32;
         let (min_v, max_v) = sample_peak(mins, maxs, t * bins as f32);
-        let x = egui::lerp(rect.left()..=rect.right(), t);
+        let mut x = egui::lerp(rect.left()..=rect.right(), t);
         let mut y_top = mid_y - max_v.clamp(-1.0, 1.0) * amp;
         let mut y_bot = mid_y - min_v.clamp(-1.0, 1.0) * amp;
         if y_bot - y_top < 1.5 {
@@ -558,8 +618,23 @@ fn paint_live_wave(
             y_top = mid - 0.75;
             y_bot = mid + 0.75;
         }
-        mesh.colored_vertex(egui::pos2(x, y_top), white);
-        mesh.colored_vertex(egui::pos2(x, y_bot), white);
+        if weather > 1.0e-4 {
+            let edge = (t * (1.0 - t) * 4.0).clamp(0.0, 1.0);
+            let swell = (phase * 0.62 + t * 6.4).sin() * 0.55
+                + (phase * 1.18 + t * 14.0 + seed).sin() * 0.30
+                + (phase * 2.35 + t * 27.0).sin() * 0.15;
+            let shimmer = (phase * 3.4 + t * 39.0 + seed * 0.7).sin();
+            let lift = (swell * 0.78 + shimmer * 0.22) * amp * (0.045 + 0.11 * weather) * edge;
+            let side = (phase * 0.95 + t * 9.5 + seed * 1.1).sin() * (0.35 + 1.1 * weather) * edge;
+            let breathe = 1.0 + (phase * 0.48 + seed).sin() * 0.035 * weather;
+            let center = 0.5 * (y_top + y_bot);
+            let half = 0.5 * (y_bot - y_top) * breathe;
+            y_top = center - half + lift;
+            y_bot = center + half + lift;
+            x += side;
+        }
+        mesh.colored_vertex(egui::pos2(x, y_top), ink);
+        mesh.colored_vertex(egui::pos2(x, y_bot), ink);
     }
     for index in 0..columns - 1 {
         let a = (index * 2) as u32;
@@ -568,8 +643,11 @@ fn paint_live_wave(
     }
     painter.add(egui::Shape::mesh(mesh));
 
-    let x = egui::lerp(rect.left()..=rect.right(), playhead);
-    painter.vline(x, rect.y_range(), Stroke::new(1.5_f32, white));
+    let mut head_x = egui::lerp(rect.left()..=rect.right(), playhead);
+    if weather > 1.0e-4 {
+        head_x += (phase * 1.7 + playhead * 12.0 + seed).sin() * (0.4 + 1.4 * weather);
+    }
+    painter.vline(head_x, rect.y_range(), Stroke::new(1.5_f32, ink));
 }
 
 fn sample_peak(mins: &[f32], maxs: &[f32], index: f32) -> (f32, f32) {
@@ -1001,7 +1079,7 @@ fn knob_help(name: &str) -> Option<&'static str> {
         "Pass" => "Chance of being sent through a HP or LP filter at various frequencies",
         "Stutter" => "Chance of repeating in place at various rates",
         "Smear" => "Chance of being processed into overlapping, slightly detuned grains",
-        "Splatter" => "Chance of being processed into rhythmic, short grains",
+        "Splatter" => "Chance of being thinned until only the strongest partials remain",
         "Wash" => "Chance of getting momentarily drenched in reverb",
         "Drift" => "Chance of a note moving towards or away from the effects' set points",
         "Luck" => "Chance of being played",
@@ -1031,16 +1109,8 @@ fn shaping(
     setter: &ParamSetter,
     kb: &mut KbState,
     params: &HyperchromaParams,
-    shared: &SharedUi,
 ) {
     ui.label(RichText::new("Shape").size(16.0).color(INK).strong());
-    ui.label(
-        RichText::new(
-            "The recordings are in C at 120 BPM. Transpose is where they sit. Sample BPM is the tempo they were played at.",
-        )
-        .size(12.0)
-        .color(STONE),
-    );
     egui::Grid::new("shape")
         .num_columns(2)
         .spacing(egui::vec2(12.0, 8.0))
@@ -1049,8 +1119,6 @@ fn shaping(
             knob(ui, setter, "Attack", &params.attack);
             knob(ui, setter, "Release", &params.release);
             knob(ui, setter, "Transpose", &params.root);
-            knob(ui, setter, "Sample BPM", &params.sample_bpm);
-            knob(ui, setter, "Tempo", &params.tempo);
         });
 
     let mut track = kb
@@ -1058,39 +1126,24 @@ fn shaping(
         .map(|edit| edit.target)
         .unwrap_or_else(|| params.keytrack.value());
     let track_clicked = ui.checkbox(&mut track, "Keytracking").changed();
-    let track = settle_bool(
+    settle_bool(
         setter,
         &params.keytrack,
         &mut kb.keytrack_edit,
         track_clicked.then_some(track),
     );
-    let track_copy = if track {
-        "The note you play transposes the recording. Transpose is the note that leaves it as recorded."
-    } else {
-        "Every note plays at Transpose. C4 leaves the recordings as they are."
-    };
-    ui.label(RichText::new(track_copy).size(12.0).color(STONE));
 
-    let mut follow = kb
-        .sync_edit
-        .map(|edit| edit.target)
-        .unwrap_or_else(|| params.sync.value());
-    let follow_clicked = ui.checkbox(&mut follow, "Follow the host tempo").changed();
-    let follow = settle_bool(
-        setter,
-        &params.sync,
-        &mut kb.sync_edit,
-        follow_clicked.then_some(follow),
-    );
-    let host = shared.host_bpm_x100.load(Ordering::Relaxed);
-    let follow_copy = if follow && host > 0 {
-        "The session tempo is moving the slices. Turn this off to use the Tempo knob."
-    } else if follow {
-        "Waiting for the DAW. Until a tempo arrives, the Tempo knob is used."
-    } else {
-        "The Tempo knob is in charge, even when the DAW is playing."
-    };
-    ui.label(RichText::new(follow_copy).size(12.0).color(STONE));
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("A-side").size(12.0).color(STONE));
+        ui.visuals_mut().selection.bg_fill = Color32::from_rgb(0xb4, 0xcc, 0xd8);
+        ui.add(
+            widgets::ParamSlider::for_param(&params.b_side, setter)
+                .with_width(220.0)
+                .without_value(),
+        );
+        ui.label(RichText::new("B-side").size(12.0).color(STONE));
+    });
 }
 
 fn knob(ui: &mut egui::Ui, setter: &ParamSetter, label: &str, param: &impl Param) {
@@ -1187,6 +1240,10 @@ fn color_label(name: &str) -> &'static str {
         "water" => "Chestnut",
         "sage" => "Birch",
         "clay" => "Indigo",
+        "mulberry" => "Mulberry",
+        "olive" => "Olive",
+        "aloe" => "Aloe",
+        "cinnamon" => "Cinnamon",
         _ => "",
     }
 }
@@ -1211,8 +1268,12 @@ fn tile_color(name: &str) -> Color32 {
         "rock" => Color32::from_rgb(0xa1, 0x5b, 0xb0),
         "steel" => Color32::from_rgb(0x5a, 0x34, 0x56),
         "water" => Color32::from_rgb(0x8a, 0x4f, 0x2e),
-        "sage" => Color32::from_rgb(0xd8, 0xd2, 0xc0),
+        "sage" => Color32::from_rgb(0xb8, 0xac, 0x92),
         "clay" => Color32::from_rgb(0x2b, 0x3f, 0x78),
+        "mulberry" => Color32::from_rgb(0x7a, 0x2e, 0x48),
+        "olive" => Color32::from_rgb(0x7a, 0x78, 0x40),
+        "aloe" => Color32::from_rgb(0xa3, 0xd0, 0xc4),
+        "cinnamon" => Color32::from_rgb(0xc1, 0x7a, 0x4e),
         _ => Color32::from_rgb(70, 96, 84),
     }
 }

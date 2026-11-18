@@ -3,9 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Canonical recording names, in the order they appear in the instrument.
-const NAMES: [&str; 20] = [
-    "bug", "dark", "dragon", "electric", "fairy", "fighting", "fire", "flying", "ghost", "grass",
-    "ground", "ice", "normal", "poison", "psychic", "rock", "steel", "water", "sage", "clay",
+const NAMES: [&str; 24] = [
+    "bug", "dark", "dragon", "electric", "fairy", "mulberry", "fighting", "fire", "flying",
+    "ghost", "grass", "olive", "ground", "ice", "normal", "poison", "psychic", "aloe", "rock",
+    "steel", "water", "sage", "clay", "cinnamon",
 ];
 
 fn main() {
@@ -39,12 +40,28 @@ fn main() {
                 continue;
             }
             let name = canonical(&stem);
-            if files.iter().any(|(existing, _)| existing == &name) {
-                println!(
-                    "cargo:warning=skipping duplicate sample {} ({})",
-                    path.display(),
-                    name
-                );
+            if let Some(index) = files.iter().position(|(existing, _)| existing == &name) {
+                let older = &files[index].1;
+                let keep_new = match (fs::metadata(&path), fs::metadata(older)) {
+                    (Ok(fresh), Ok(prior)) => fresh.modified().ok() >= prior.modified().ok(),
+                    _ => true,
+                };
+                if keep_new {
+                    println!(
+                        "cargo:warning=replacing older sample {} with {} ({})",
+                        older.display(),
+                        path.display(),
+                        name
+                    );
+                    files[index] = (name, path.clone());
+                    println!("cargo:rerun-if-changed={}", path.display());
+                } else {
+                    println!(
+                        "cargo:warning=skipping older duplicate sample {} ({})",
+                        path.display(),
+                        name
+                    );
+                }
                 continue;
             }
             println!("cargo:rerun-if-changed={}", path.display());
@@ -72,6 +89,18 @@ fn main() {
 
 fn canonical(stem: &str) -> String {
     let lower = stem.to_ascii_lowercase();
+    // B-sides first so `bug_b` is not collapsed into `bug`.
+    for name in NAMES {
+        if lower == format!("{name}_b")
+            || lower.starts_with(&format!("{name}_b_"))
+            || lower.starts_with(&format!("{name}_b-"))
+            || lower == format!("{name}-b")
+            || lower.starts_with(&format!("{name}-b_"))
+            || lower.starts_with(&format!("{name}-b-"))
+        {
+            return format!("{name}_b");
+        }
+    }
     for name in NAMES {
         if lower == name
             || lower.starts_with(&format!("{name}_"))
@@ -84,6 +113,11 @@ fn canonical(stem: &str) -> String {
 }
 
 fn name_rank(name: &str) -> (usize, String) {
+    if let Some(base) = name.strip_suffix("_b") {
+        if let Some(index) = NAMES.iter().position(|n| *n == base) {
+            return (index, "b".to_string());
+        }
+    }
     match NAMES.iter().position(|n| *n == name) {
         Some(index) => (index, String::new()),
         None => (NAMES.len(), name.to_string()),

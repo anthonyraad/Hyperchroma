@@ -3,7 +3,6 @@ use crate::bank::Bank;
 const MAX_VOICES: usize = 16;
 const MAX_GRAINS: usize = 3;
 const SMEAR_GRAINS: usize = 6;
-const SPLATTER_GRAINS: usize = 4;
 const MAX_SAMPLES: usize = 32;
 const ESCAPE_COMBS: usize = 4;
 const ESCAPE_REGIONS: usize = 8;
@@ -75,12 +74,14 @@ pub struct GlobalRoll {
     pub stutter: f32,
     /// Chance the note's slices scatter around the playhead.
     pub smear: f32,
-    /// Chance the note gains a patter of short, soft grains.
+    /// Chance the note is sent through the spectral gate.
     pub splatter: f32,
     /// Chance the note is set into a short, distant reverb.
     pub escape: f32,
     /// Chance the note eases toward the other knobs, or from them back to dry.
     pub drift: f32,
+    /// Chance the chosen color plays its B-side. `0` is always A, `1` is always B.
+    pub b_side: f32,
 }
 
 impl GlobalRoll {
@@ -94,6 +95,7 @@ impl GlobalRoll {
             splatter: 0.0,
             escape: 0.0,
             drift: 0.0,
+            b_side: 0.0,
         }
     }
 }
@@ -132,6 +134,8 @@ struct Voice {
     channel: u8,
     voice_id: Option<i32>,
     sample: usize,
+    /// When true, this voice reads the color's B-side recording.
+    side_b: bool,
     playhead: f64,
     grains: [Grain; MAX_GRAINS],
     env: f32,
@@ -172,26 +176,6 @@ struct Voice {
     smear_voices: u8,
     smear_wait: usize,
     smear_grains: [Grain; SMEAR_GRAINS],
-    splatter: bool,
-    /// Scatter radius in recording frames.
-    splatter_radius: f64,
-    /// Center grain length in output samples.
-    splatter_len: usize,
-    splatter_lo: f32,
-    splatter_hi: f32,
-    splatter_detune: f32,
-    splatter_glint: f32,
-    splatter_width: f32,
-    splatter_gain: f32,
-    splatter_gap_min: usize,
-    splatter_gap_max: usize,
-    splatter_voices: u8,
-    splatter_wait: usize,
-    /// Opening taps still due to land closer together.
-    splatter_burst: u8,
-    /// Soft rise of each tap, in output samples.
-    splatter_attack: usize,
-    splatter_grains: [Grain; SPLATTER_GRAINS],
     drift: bool,
     drift_from_center: bool,
     drift_pos: u32,
@@ -238,6 +222,7 @@ impl Voice {
             channel: 0,
             voice_id: None,
             sample: 0,
+            side_b: false,
             playhead: 0.0,
             grains: [Grain::off(); MAX_GRAINS],
             env: 0.0,
@@ -275,22 +260,6 @@ impl Voice {
             smear_voices: 0,
             smear_wait: 0,
             smear_grains: [Grain::off(); SMEAR_GRAINS],
-            splatter: false,
-            splatter_radius: 0.0,
-            splatter_len: 0,
-            splatter_lo: 1.0,
-            splatter_hi: 1.0,
-            splatter_detune: 0.0,
-            splatter_glint: 0.0,
-            splatter_width: 0.0,
-            splatter_gain: 0.0,
-            splatter_gap_min: 1,
-            splatter_gap_max: 1,
-            splatter_voices: 0,
-            splatter_wait: 0,
-            splatter_burst: 0,
-            splatter_attack: 1,
-            splatter_grains: [Grain::off(); SPLATTER_GRAINS],
             drift: false,
             drift_from_center: true,
             drift_pos: 0,
@@ -398,8 +367,6 @@ pub struct Engine {
     /// Remaining smear degrees, dealt in a shuffled order.
     smear_bag: [SmearDegree; 3],
     smear_left: u8,
-    splatter_bag: [SplatterDegree; 3],
-    splatter_left: u8,
     escape_bag: [EscapeDegree; 3],
     escape_left: u8,
     /// One captured roll per voice, laid out as `voice * stutter_cap`.
@@ -428,12 +395,6 @@ impl Engine {
             crush_left: 0,
             smear_bag: [SmearDegree::Little, SmearDegree::Moderate, SmearDegree::Lot],
             smear_left: 0,
-            splatter_bag: [
-                SplatterDegree::Little,
-                SplatterDegree::Moderate,
-                SplatterDegree::Lot,
-            ],
-            splatter_left: 0,
             escape_bag: [EscapeDegree::Little, EscapeDegree::Moderate, EscapeDegree::Lot],
             escape_left: 0,
             stutter_l: Vec::new(),
@@ -535,7 +496,9 @@ impl Engine {
             return None;
         }
         let sample_index = self.choose_sample(request.sample, weights)?;
-        let pcm = &self.bank.samples[sample_index];
+        let side_b = self.bank.has_b(sample_index)
+            && self.rng.unit() < self.global.b_side.clamp(0.0, 1.0);
+        let pcm = self.bank.pcm(sample_index, side_b)?;
         let frames = pcm.frames.max(1) as f64;
         let source_rate = pcm.sample_rate as f64;
         let start = match request.start_norm {
@@ -658,11 +621,6 @@ impl Engine {
         } else {
             fired(&mut self.rng, chance(self.global.splatter))
         };
-        let mut splatter_tone = if splatter {
-            Some(splatter_setup(self.take_splatter()))
-        } else {
-            None
-        };
         let mut dest_splatter = if drift {
             knob(self.global.splatter)
         } else if splatter {
@@ -733,7 +691,6 @@ impl Engine {
                         dest_smear = 1.0;
                     }
                     Weather::Splatter => {
-                        splatter_tone = Some(splatter_setup(self.take_splatter()));
                         dest_splatter = 1.0;
                     }
                     Weather::Escape => {
@@ -775,9 +732,6 @@ impl Engine {
                         if dest_smear > 0.001 {
                             smear_tone = Some(smear_setup(self.take_smear()));
                         }
-                        if dest_splatter > 0.001 {
-                            splatter_tone = Some(splatter_setup(self.take_splatter()));
-                        }
                         if dest_escape > 0.001 {
                             escape = true;
                             escape_tone = Some(escape_setup(self.take_escape()));
@@ -802,6 +756,7 @@ impl Engine {
         voice.channel = request.channel;
         voice.voice_id = request.voice_id;
         voice.sample = sample_index;
+        voice.side_b = side_b;
         voice.playhead = start;
         voice.serial = serial;
         voice.until_next = 0;
@@ -846,27 +801,6 @@ impl Engine {
             let gap_max = (self.sample_rate as f64 * tone.gap_max).round().max(gap_min);
             voice.smear_gap_min = gap_min as usize;
             voice.smear_gap_max = gap_max as usize;
-        }
-        if let Some(tone) = splatter_tone {
-            voice.splatter = true;
-            voice.splatter_radius = tone.radius_secs * source_rate;
-            voice.splatter_len = (self.sample_rate as f64 * tone.grain_secs)
-                .round()
-                .max(2.0) as usize;
-            voice.splatter_lo = tone.grain_lo;
-            voice.splatter_hi = tone.grain_hi;
-            voice.splatter_detune = tone.detune;
-            voice.splatter_glint = tone.glint;
-            voice.splatter_width = tone.width;
-            voice.splatter_gain = tone.gain;
-            voice.splatter_voices = tone.voices;
-            voice.splatter_attack = (self.sample_rate as f64 * 0.003).round().max(1.0) as usize;
-            voice.splatter_burst = 3;
-            voice.splatter_wait = 0;
-            let gap_min = (self.sample_rate as f64 * tone.gap_min).round().max(1.0);
-            let gap_max = (self.sample_rate as f64 * tone.gap_max).round().max(gap_min);
-            voice.splatter_gap_min = gap_min as usize;
-            voice.splatter_gap_max = gap_max as usize;
         }
         if let Some(tone) = escape_tone {
             self.arm_escape(&mut voice, &tone);
@@ -959,28 +893,39 @@ impl Engine {
     /// With keytracking on, the played note transposes around `root`. With it off, every note
     /// sounds at `root`, measured from C4, which is how the recordings were played.
     pub fn render(&mut self, root: i32, tempo_ratio: f32, keytrack: bool) -> (f32, f32) {
+        let (dry_l, dry_r, wet_l, wet_r) = self.render_buses(root, tempo_ratio, keytrack);
+        (dry_l + wet_l, dry_r + wet_r)
+    }
+
+    /// Dry notes, then notes that caught Splatter. The spectral gate runs once on the wet bus.
+    pub fn render_buses(
+        &mut self,
+        root: i32,
+        tempo_ratio: f32,
+        keytrack: bool,
+    ) -> (f32, f32, f32, f32) {
         let tempo_ratio = if tempo_ratio.is_finite() {
             tempo_ratio.clamp(0.05, 8.0)
         } else {
             1.0
         };
-        let mut left = 0.0f32;
-        let mut right = 0.0f32;
+        let mut dry_l = 0.0f32;
+        let mut dry_r = 0.0f32;
+        let mut wet_l = 0.0f32;
+        let mut wet_r = 0.0f32;
         for index in 0..MAX_VOICES {
             if !self.voices[index].active {
                 continue;
             }
             let (voice_l, voice_r) = self.render_voice(index, root, tempo_ratio, keytrack);
-            left += voice_l;
-            right += voice_r;
+            let send = effect_amount(&self.voices[index], self.voices[index].dest_splatter);
+            let keep = 1.0 - send;
+            dry_l += voice_l * keep;
+            dry_r += voice_r * keep;
+            wet_l += voice_l * send;
+            wet_r += voice_r * send;
         }
-        if !left.is_finite() {
-            left = 0.0;
-        }
-        if !right.is_finite() {
-            right = 0.0;
-        }
-        (left, right)
+        (finite_sample(dry_l), finite_sample(dry_r), finite_sample(wet_l), finite_sample(wet_r))
     }
 
     pub fn voice_count(&self) -> usize {
@@ -997,12 +942,38 @@ impl Engine {
         mask
     }
 
+    /// Colors whose newest sounding voice is on the B-side.
+    pub fn b_side_mask(&self) -> u32 {
+        let mut mask = 0u32;
+        let mut serials = [0u32; 32];
+        let mut seen = [false; 32];
+        for voice in &self.voices {
+            if !voice.active || voice.sample >= 32 {
+                continue;
+            }
+            let slot = voice.sample;
+            if seen[slot] && voice.serial < serials[slot] {
+                continue;
+            }
+            seen[slot] = true;
+            serials[slot] = voice.serial;
+            if voice.side_b {
+                mask |= 1 << slot;
+            } else {
+                mask &= !(1 << slot);
+            }
+        }
+        mask
+    }
+
     /// Normalized playhead of the newest sounding voice in each slot, in parts per million.
-    /// Silent slots are `u32::MAX`. `serials` is scratch and can be discarded.
-    pub fn write_playheads(&self, heads: &mut [u32], serials: &mut [u32]) {
-        let count = heads.len().min(serials.len());
+    /// Silent slots are `u32::MAX`. `weather` is the strongest global-effect amount for that
+    /// voice, also in parts per million. `serials` is scratch and can be discarded.
+    pub fn write_playheads(&self, heads: &mut [u32], weather: &mut [u32], serials: &mut [u32]) {
+        let count = heads.len().min(weather.len()).min(serials.len());
         for index in 0..count {
             heads[index] = u32::MAX;
+            weather[index] = 0;
             serials[index] = 0;
         }
         for voice in &self.voices {
@@ -1013,7 +984,7 @@ impl Engine {
             if heads[slot] != u32::MAX && voice.serial < serials[slot] {
                 continue;
             }
-            let Some(pcm) = self.bank.samples.get(slot) else {
+            let Some(pcm) = self.bank.pcm(slot, voice.side_b) else {
                 continue;
             };
             if pcm.frames == 0 {
@@ -1021,6 +992,7 @@ impl Engine {
             }
             let norm = (voice.playhead / pcm.frames as f64).rem_euclid(1.0);
             heads[slot] = ((norm * 1_000_000.0).round() as u32).min(999_999);
+            weather[slot] = (voice_weather_intensity(voice) * 1_000_000.0).round() as u32;
             serials[slot] = voice.serial;
         }
     }
@@ -1105,7 +1077,8 @@ impl Engine {
         }
 
         let sample_index = self.voices[index].sample;
-        let (frames, sample_rate) = match self.bank.samples.get(sample_index) {
+        let side_b = self.voices[index].side_b;
+        let (frames, sample_rate) = match self.bank.pcm(sample_index, side_b) {
             Some(pcm) if pcm.frames >= 2 => (pcm.frames, pcm.sample_rate),
             _ => {
                 self.voices[index] = Voice::inactive();
@@ -1191,7 +1164,11 @@ impl Engine {
             let age = grain.age.min(grain_len.saturating_sub(1));
             let window = self.hann[age];
             let position = grain.origin + grain.age as f64 * read_inc;
-            let (sample_l, sample_r) = self.bank.samples[sample_index].read(position);
+            let (sample_l, sample_r) = self
+                .bank
+                .pcm(sample_index, side_b)
+                .map(|pcm| pcm.read(position))
+                .unwrap_or((0.0, 0.0));
             left += sample_l * window;
             right += sample_r * window;
             grain.age += 1;
@@ -1211,7 +1188,6 @@ impl Engine {
             left = left * (1.0 - smear_amount) + cloud_l * smear_amount;
             right = right * (1.0 - smear_amount) + cloud_r * smear_amount;
         }
-        let (left, right) = self.mix_splatter(index, sample_index, frames as f64, read_inc, playhead, left, right);
         self.finish_voice(index, left, right, pan)
     }
 
@@ -1233,7 +1209,6 @@ impl Engine {
         let (left, right) = self.smear_sum(index, sample_index, frames, read_inc, playhead);
         self.voices[index].playhead = playhead;
         self.apply_drift(index);
-        let (left, right) = self.mix_splatter(index, sample_index, frames, read_inc, playhead, left, right);
         self.finish_voice(index, left, right, pan)
     }
 
@@ -1309,7 +1284,12 @@ impl Engine {
             let age = grain.age.min(limit.saturating_sub(1));
             let window = bloom_window(age, limit);
             let position = grain.origin + grain.age as f64 * read_inc * grain.step_mul;
-            let (sample_l, sample_r) = self.bank.samples[sample_index].read(position);
+            let side_b = self.voices[index].side_b;
+            let (sample_l, sample_r) = self
+                .bank
+                .pcm(sample_index, side_b)
+                .map(|pcm| pcm.read(position))
+                .unwrap_or((0.0, 0.0));
             let level = window * grain.gain;
             let steer = grain.pan.clamp(-1.0, 1.0);
             left += sample_l * level * (1.0 - steer.max(0.0));
@@ -1319,119 +1299,6 @@ impl Engine {
 
         self.voices[index].smear_grains = grains;
         self.voices[index].smear_wait = wait;
-        (left, right)
-    }
-
-    /// The taps replace the note. Drift eases from the dry recording into the patter.
-    fn mix_splatter(
-        &mut self,
-        index: usize,
-        sample_index: usize,
-        frames: f64,
-        read_inc: f64,
-        playhead: f64,
-        left: f32,
-        right: f32,
-    ) -> (f32, f32) {
-        let amount = effect_amount(&self.voices[index], self.voices[index].dest_splatter);
-        if amount <= 0.001 {
-            return (left, right);
-        }
-        let (tap_l, tap_r) = self.splatter_sum(index, sample_index, frames, read_inc, playhead);
-        (
-            left * (1.0 - amount) + tap_l * amount,
-            right * (1.0 - amount) + tap_r * amount,
-        )
-    }
-
-    /// A sparse patter of short grains around the playhead.
-    fn splatter_sum(
-        &mut self,
-        index: usize,
-        sample_index: usize,
-        frames: f64,
-        read_inc: f64,
-        playhead: f64,
-    ) -> (f32, f32) {
-        let radius = self.voices[index].splatter_radius;
-        let center = self.voices[index].splatter_len.max(2);
-        let lo = self.voices[index].splatter_lo as f64;
-        let hi = self.voices[index].splatter_hi.max(self.voices[index].splatter_lo) as f64;
-        let detune = self.voices[index].splatter_detune;
-        let glint = self.voices[index].splatter_glint;
-        let width = self.voices[index].splatter_width;
-        let level = self.voices[index].splatter_gain;
-        let gap_min = self.voices[index].splatter_gap_min.max(1);
-        let gap_max = self.voices[index].splatter_gap_max.max(gap_min);
-        let max_voices = self.voices[index].splatter_voices.max(1) as usize;
-        let attack = self.voices[index].splatter_attack.max(1);
-        let mut grains = self.voices[index].splatter_grains;
-        let mut wait = self.voices[index].splatter_wait;
-        let mut burst = self.voices[index].splatter_burst;
-
-        for grain in &mut grains {
-            if grain.on && grain.age >= grain.len {
-                grain.on = false;
-            }
-        }
-        if wait == 0 {
-            let sounding = grains.iter().filter(|grain| grain.on).count();
-            if sounding < max_voices {
-                if let Some(slot) = grains.iter_mut().find(|grain| !grain.on) {
-                    let spread = self.rng.unit() as f64 * 2.0 - 1.0;
-                    let jitter = spread * radius;
-                    let cents = (self.rng.unit() * 2.0 - 1.0) * detune;
-                    let mut step_mul = 2.0_f64.powf(cents as f64 / 1_200.0);
-                    let gain = level * (0.9 + self.rng.unit() * 0.1);
-                    if self.rng.unit() < glint {
-                        let harmonic = if self.rng.unit() < 0.5 { 2.0 } else { 1.498_307 };
-                        step_mul *= harmonic;
-                    }
-                    let span = (center as f64 * (lo + self.rng.unit() as f64 * (hi - lo)))
-                        .round()
-                        .max(2.0) as usize;
-                    slot.on = true;
-                    slot.age = 0;
-                    slot.origin = (playhead + jitter).rem_euclid(frames);
-                    slot.smear = true;
-                    slot.step_mul = step_mul;
-                    slot.gain = gain;
-                    slot.len = span;
-                    slot.pan = (self.rng.unit() * 2.0 - 1.0) * width;
-                }
-            }
-            let pick = self.rng.unit();
-            let mut gap = gap_min + ((gap_max - gap_min) as f32 * pick).round() as usize;
-            if burst > 0 {
-                gap = ((gap as f32) * 0.45).round().max(1.0) as usize;
-                burst -= 1;
-            }
-            wait = gap.max(1);
-        } else {
-            wait -= 1;
-        }
-
-        let mut left = 0.0f32;
-        let mut right = 0.0f32;
-        for grain in &mut grains {
-            if !grain.on {
-                continue;
-            }
-            let limit = grain.len.max(1);
-            let age = grain.age.min(limit.saturating_sub(1));
-            let window = tick_window(age, limit, attack);
-            let position = grain.origin + grain.age as f64 * read_inc * grain.step_mul;
-            let (sample_l, sample_r) = self.bank.samples[sample_index].read(position);
-            let level = window * grain.gain;
-            let steer = grain.pan.clamp(-1.0, 1.0);
-            left += sample_l * level * (1.0 - steer.max(0.0));
-            right += sample_r * level * (1.0 + steer.min(0.0));
-            grain.age += 1;
-        }
-
-        self.voices[index].splatter_grains = grains;
-        self.voices[index].splatter_wait = wait;
-        self.voices[index].splatter_burst = burst;
         (left, right)
     }
 
@@ -1779,7 +1646,15 @@ impl Engine {
             return ideal;
         }
 
-        let pcm = &self.bank.samples[sample_index];
+        let side_b = self
+            .voices
+            .iter()
+            .find(|voice| voice.active && voice.sample == sample_index)
+            .map(|voice| voice.side_b)
+            .unwrap_or(false);
+        let Some(pcm) = self.bank.pcm(sample_index, side_b) else {
+            return ideal;
+        };
         let mut heard = [0.0f32; 512];
         for (k, slot) in heard.iter_mut().enumerate().take(compare) {
             let position = previous.origin + (previous.age as f64 + k as f64) * read_inc;
@@ -1856,6 +1731,14 @@ fn rolled_pan(rng: &mut Rng, pan: f32) -> PanSide {
         PanSide::Right
     } else {
         PanSide::Center
+    }
+}
+
+fn finite_sample(sample: f32) -> f32 {
+    if sample.is_finite() {
+        sample
+    } else {
+        0.0
     }
 }
 
@@ -1948,23 +1831,6 @@ impl Engine {
         self.smear_bag[self.smear_left as usize]
     }
 
-    fn take_splatter(&mut self) -> SplatterDegree {
-        if self.splatter_left == 0 {
-            self.splatter_bag = [
-                SplatterDegree::Little,
-                SplatterDegree::Moderate,
-                SplatterDegree::Lot,
-            ];
-            for index in (1..3).rev() {
-                let swap = (self.rng.unit() * (index as f32 + 1.0)).floor() as usize;
-                self.splatter_bag.swap(index, swap);
-            }
-            self.splatter_left = 3;
-        }
-        self.splatter_left -= 1;
-        self.splatter_bag[self.splatter_left as usize]
-    }
-
     fn take_escape(&mut self) -> EscapeDegree {
         if self.escape_left == 0 {
             self.escape_bag = [EscapeDegree::Little, EscapeDegree::Moderate, EscapeDegree::Lot];
@@ -2039,6 +1905,23 @@ fn effect_amount(voice: &Voice, dest: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Strongest global-effect presence on this voice. Drift scales the destinations, so
+/// weather rises when drifting into an effect and falls when drifting back to dry.
+fn voice_weather_intensity(voice: &Voice) -> f32 {
+    [
+        voice.dest_swell,
+        voice.dest_crush,
+        voice.dest_pass,
+        voice.dest_stutter,
+        voice.dest_smear,
+        voice.dest_splatter,
+        voice.dest_escape,
+    ]
+    .into_iter()
+    .map(|dest| effect_amount(voice, dest))
+    .fold(0.0f32, f32::max)
 }
 
 fn drifted_hz(mode: PassMode, target: f32, depth: f32) -> f32 {
@@ -2117,28 +2000,6 @@ struct SmearTone {
     width: f32,
 }
 
-/// How fine a splattered note's taps are. Little is a rustle, lot is a sprinkle.
-#[derive(Clone, Copy)]
-enum SplatterDegree {
-    Little,
-    Moderate,
-    Lot,
-}
-
-struct SplatterTone {
-    radius_secs: f64,
-    grain_secs: f64,
-    grain_lo: f32,
-    grain_hi: f32,
-    gap_min: f64,
-    gap_max: f64,
-    voices: u8,
-    detune: f32,
-    glint: f32,
-    width: f32,
-    gain: f32,
-}
-
 fn smear_setup(degree: SmearDegree) -> SmearTone {
     match degree {
         SmearDegree::Little => SmearTone {
@@ -2177,50 +2038,6 @@ fn smear_setup(degree: SmearDegree) -> SmearTone {
     }
 }
 
-fn splatter_setup(degree: SplatterDegree) -> SplatterTone {
-    match degree {
-        SplatterDegree::Little => SplatterTone {
-            radius_secs: 0.08,
-            grain_secs: 0.038,
-            grain_lo: 0.030_f32 / 0.038,
-            grain_hi: 0.048_f32 / 0.038,
-            gap_min: 0.080,
-            gap_max: 0.140,
-            voices: 2,
-            detune: 8.0,
-            glint: 0.30,
-            width: 0.35,
-            gain: 0.92,
-        },
-        SplatterDegree::Moderate => SplatterTone {
-            radius_secs: 0.25,
-            grain_secs: 0.024,
-            grain_lo: 0.018_f32 / 0.024,
-            grain_hi: 0.032_f32 / 0.024,
-            gap_min: 0.040,
-            gap_max: 0.080,
-            voices: 3,
-            detune: 12.0,
-            glint: 0.50,
-            width: 0.55,
-            gain: 0.82,
-        },
-        SplatterDegree::Lot => SplatterTone {
-            radius_secs: 0.50,
-            grain_secs: 0.014,
-            grain_lo: 0.010_f32 / 0.014,
-            grain_hi: 0.020_f32 / 0.014,
-            gap_min: 0.022,
-            gap_max: 0.048,
-            voices: 4,
-            detune: 16.0,
-            glint: 0.70,
-            width: 0.75,
-            gain: 0.68,
-        },
-    }
-}
-
 /// A long fade-in and a slower fade-out, so a slice blooms instead of pulsing.
 fn bloom_window(age: usize, len: usize) -> f32 {
     if len <= 1 {
@@ -2233,23 +2050,6 @@ fn bloom_window(age: usize, len: usize) -> f32 {
     } else {
         let u = ((t - 0.55) / 0.45).clamp(0.0, 1.0);
         0.5 + 0.5 * (u * std::f32::consts::PI).cos()
-    }
-}
-
-/// A short rise and a longer fall, so a slice ticks instead of blooming.
-fn tick_window(age: usize, len: usize, attack: usize) -> f32 {
-    if len <= 1 {
-        return 1.0;
-    }
-    let attack = attack.clamp(1, (len / 3).max(1));
-    let t = age as f32;
-    if t < attack as f32 {
-        let u = t / attack as f32;
-        (u * std::f32::consts::FRAC_PI_2).sin()
-    } else {
-        let span = (len - attack) as f32;
-        let u = ((t - attack as f32) / span).clamp(0.0, 1.0);
-        0.5 + 0.5 * ((1.0 - u) * std::f32::consts::PI).cos()
     }
 }
 
@@ -2346,6 +2146,7 @@ mod tests {
                 Pcm::mono("sine", sample_rate, sine(frames, sample_rate, 220.0, 0.5)),
                 Pcm::mono("other", sample_rate, sine(frames, sample_rate, 330.0, 0.5)),
             ],
+            b_sides: vec![None, None],
             errors: Vec::new(),
         }
     }
@@ -3050,43 +2851,14 @@ mod tests {
     }
 
     #[test]
-    fn splatter_deals_three_short_grains_and_replaces_the_note() {
-        let little = (44_100.0_f64 * 0.038).round() as usize;
-        let moderate = (44_100.0_f64 * 0.024).round() as usize;
-        let lot = (44_100.0_f64 * 0.014).round() as usize;
-        let mut engine = Engine::new(44_100.0, tone_bank(), 1);
-        engine.set_global(GlobalRoll {
-            splatter: 1.0,
+    fn splatter_catches_the_note_and_leaves_the_recording_intact() {
+        let mut missed = Engine::new(44_100.0, tone_bank(), 4);
+        missed.set_global(GlobalRoll {
+            splatter: 0.0,
             ..GlobalRoll::off()
         });
-        let mut dealt = [0usize; 3];
-        for index in 0..3 {
-            engine.note_on(
-                NoteOn {
-                    note: 60 + index as u8,
-                    velocity: 1.0,
-                    channel: 0,
-                    voice_id: Some(index as i32),
-                    sample: Some(0),
-                    start_norm: Some(0.0),
-                },
-                &[1.0],
-                &[SliceRolls::neutral()],
-                1.0,
-            );
-            dealt[index] = engine
-                .voices
-                .iter()
-                .find(|voice| voice.voice_id == Some(index as i32))
-                .unwrap()
-                .splatter_len;
-        }
-        dealt.sort_unstable();
-        assert_eq!(dealt, [lot, moderate, little]);
-
-        let mut clean = Engine::new(44_100.0, tone_bank(), 4);
-        let mut tapped = Engine::new(44_100.0, tone_bank(), 4);
-        tapped.set_global(GlobalRoll {
+        let mut caught = Engine::new(44_100.0, tone_bank(), 4);
+        caught.set_global(GlobalRoll {
             splatter: 1.0,
             ..GlobalRoll::off()
         });
@@ -3098,10 +2870,10 @@ mod tests {
             sample: Some(0),
             start_norm: Some(0.2),
         };
-        clean
+        missed
             .note_on(request, &[1.0], &[SliceRolls::neutral()], 1.0)
             .unwrap();
-        tapped
+        caught
             .note_on(
                 NoteOn {
                     note: 60,
@@ -3116,34 +2888,27 @@ mod tests {
                 1.0,
             )
             .unwrap();
-        let plain = render_for(&mut clean, 12_000, 60, 1.0);
-        let patter = render_for(&mut tapped, 12_000, 60, 1.0);
-        let difference = plain
-            .iter()
-            .zip(&patter)
-            .map(|(dry, wet)| (dry - wet).abs())
-            .fold(0.0f32, f32::max);
+        assert!(missed.voices[0].dest_splatter < 0.001);
+        assert!(caught.voices[0].dest_splatter > 0.99);
+
+        let mut dry_energy = 0.0f32;
+        let mut wet_energy = 0.0f32;
+        let mut difference = 0.0f32;
+        for _ in 0..4_000 {
+            let (plain_l, _) = missed.render(60, 1.0, true);
+            let (dry_l, _, wet_l, _) = caught.render_buses(60, 1.0, true);
+            dry_energy += dry_l.abs();
+            wet_energy += wet_l.abs();
+            difference += (plain_l - (dry_l + wet_l)).abs();
+        }
         assert!(
-            difference > 0.15,
-            "splatter should replace the note with taps, peak difference {difference}"
+            dry_energy < 1.0e-3,
+            "a caught note should leave the dry bus, energy {dry_energy}"
         );
-        let likeness = correlation(&plain, &patter);
+        assert!(wet_energy > 1.0, "a caught note should feed the gate, energy {wet_energy}");
         assert!(
-            likeness < 0.85,
-            "the steady note should drop out between taps, correlation {likeness}"
-        );
-        let shortest = (44_100.0_f64 * 0.010).round() as usize;
-        let longest = (44_100.0_f64 * 0.048).round() as usize;
-        let grain = tapped
-            .voices[0]
-            .splatter_grains
-            .iter()
-            .find(|grain| grain.len > 0)
-            .expect("a tap should have been dealt");
-        assert!(
-            grain.len >= shortest && grain.len <= longest,
-            "tap length {} should stay between {shortest} and {longest}",
-            grain.len
+            difference < 1.0e-3,
+            "catching splatter should not change the note itself, difference {difference}"
         );
     }
 

@@ -9,11 +9,13 @@ use nih_plug_egui::{create_egui_editor, EguiState};
 use crate::bank::BankSnapshot;
 use crate::engine::{Engine, GlobalRoll, NoteOn, SliceRolls};
 use crate::names::{note_name, parse_note};
+use crate::spectral_gate::SpectralGate;
 
 pub mod bank;
 mod editor;
 pub mod engine;
 pub mod names;
+mod spectral_gate;
 
 use editor::KbState;
 
@@ -27,12 +29,17 @@ pub struct SharedUi {
     pub last_index: AtomicU32,
     pub last_ppm: AtomicU32,
     pub active_mask: AtomicU32,
+    /// Colors whose newest voice is reading the B-side.
+    pub b_side_mask: AtomicU32,
     pub voices: AtomicU32,
     pub host_bpm_x100: AtomicU32,
     /// Bank slot the editor asked to audition, or `u32::MAX` when idle.
     pub preview_slot: AtomicU32,
     /// Playhead in parts per million, or `u32::MAX` when that recording is silent.
     pub playhead_ppm: [AtomicU32; SAMPLE_SLOTS],
+    /// How hard a global effect is hitting the newest voice in that slot, in parts per
+    /// million. Drift multiplies this, so the waveform can settle or stir over the note.
+    pub weather_ppm: [AtomicU32; SAMPLE_SLOTS],
 }
 
 impl Default for SharedUi {
@@ -43,10 +50,12 @@ impl Default for SharedUi {
             last_index: AtomicU32::new(u32::MAX),
             last_ppm: AtomicU32::new(0),
             active_mask: AtomicU32::new(0),
+            b_side_mask: AtomicU32::new(0),
             voices: AtomicU32::new(0),
             host_bpm_x100: AtomicU32::new(0),
             preview_slot: AtomicU32::new(u32::MAX),
             playhead_ppm: std::array::from_fn(|_| AtomicU32::new(u32::MAX)),
+            weather_ppm: std::array::from_fn(|_| AtomicU32::new(0)),
         }
     }
 }
@@ -61,6 +70,11 @@ pub struct Hyperchroma {
     /// Samples left in the editor's audition, and whether one is sounding.
     preview_left: u32,
     preview_on: bool,
+    gate: SpectralGate,
+    dry_l: Vec<f32>,
+    dry_r: Vec<f32>,
+    wet_l: Vec<f32>,
+    wet_r: Vec<f32>,
 }
 
 #[derive(Params)]
@@ -174,7 +188,7 @@ fn pan_parse(text: &str) -> Option<f32> {
 
 #[derive(Params)]
 pub struct HyperchromaParams {
-    #[persist = "editor-state-8"]
+    #[persist = "editor-state-9"]
     editor_state: Arc<EguiState>,
 
     #[id = "gain"]
@@ -225,6 +239,10 @@ pub struct HyperchromaParams {
     #[id = "drift"]
     pub drift: FloatParam,
 
+    /// Chance a color plays its B-side. `0` is always A, `1` is always B, in 5% steps.
+    #[id = "bside"]
+    pub b_side: FloatParam,
+
     #[nested(id_prefix = "bug", group = "Poppy")]
     pub bug: SliceParams,
     #[nested(id_prefix = "dark", group = "Rosehip")]
@@ -265,6 +283,14 @@ pub struct HyperchromaParams {
     pub sage: SliceParams,
     #[nested(id_prefix = "clay", group = "Indigo")]
     pub clay: SliceParams,
+    #[nested(id_prefix = "mulberry", group = "Mulberry")]
+    pub mulberry: SliceParams,
+    #[nested(id_prefix = "olive", group = "Olive")]
+    pub olive: SliceParams,
+    #[nested(id_prefix = "aloe", group = "Aloe")]
+    pub aloe: SliceParams,
+    #[nested(id_prefix = "cinnamon", group = "Cinnamon")]
+    pub cinnamon: SliceParams,
 }
 
 impl HyperchromaParams {
@@ -290,6 +316,10 @@ impl HyperchromaParams {
             "water" => &self.water,
             "sage" => &self.sage,
             "clay" => &self.clay,
+            "mulberry" => &self.mulberry,
+            "olive" => &self.olive,
+            "aloe" => &self.aloe,
+            "cinnamon" => &self.cinnamon,
             _ => return None,
         })
     }
@@ -310,6 +340,11 @@ impl Default for Hyperchroma {
             peak_decay: 0.999,
             preview_left: 0,
             preview_on: false,
+            gate: SpectralGate::new(44_100.0),
+            dry_l: Vec::new(),
+            dry_r: Vec::new(),
+            wet_l: Vec::new(),
+            wet_r: Vec::new(),
         }
     }
 }
@@ -387,6 +422,17 @@ impl Default for HyperchromaParams {
             splatter: percent_param("Splatter", 0.0),
             escape: percent_param("Wash", 0.0),
             drift: percent_param("Drift", 0.0),
+            b_side: FloatParam::new(
+                "B-side",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                },
+            )
+            .with_step_size(0.05)
+            .with_value_to_string(Arc::new(percent_text))
+            .with_string_to_value(Arc::new(percent_parse)),
             bug: SliceParams::new(),
             dark: SliceParams::new(),
             dragon: SliceParams::new(),
@@ -407,6 +453,10 @@ impl Default for HyperchromaParams {
             water: SliceParams::new(),
             sage: SliceParams::new(),
             clay: SliceParams::new(),
+            mulberry: SliceParams::new(),
+            olive: SliceParams::new(),
+            aloe: SliceParams::new(),
+            cinnamon: SliceParams::new(),
         }
     }
 }
@@ -452,11 +502,18 @@ impl Plugin for Hyperchroma {
         &mut self,
         _audio_io_layout: &AudioIOLayout,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext<Self>,
+        context: &mut impl InitContext<Self>,
     ) -> bool {
         // Decoding logs at info. The scanner has nowhere to send that, so keep it quiet.
         nih_plug::log::set_max_level(nih_plug::log::LevelFilter::Warn);
         self.engine.set_sample_rate(buffer_config.sample_rate);
+        self.gate.set_sample_rate(buffer_config.sample_rate);
+        context.set_latency_samples(self.gate.latency_samples());
+        let block = buffer_config.max_buffer_size.max(1) as usize;
+        self.dry_l.resize(block, 0.0);
+        self.dry_r.resize(block, 0.0);
+        self.wet_l.resize(block, 0.0);
+        self.wet_r.resize(block, 0.0);
         if !self.samples_loaded {
             let loaded = bank::load_embedded();
             if let Ok(mut snapshot) = self.shared.snapshot.lock() {
@@ -472,15 +529,20 @@ impl Plugin for Hyperchroma {
 
     fn reset(&mut self) {
         self.engine.silence();
+        self.gate.reset();
         self.preview_on = false;
         self.preview_left = 0;
         self.shared.preview_slot.store(u32::MAX, Ordering::Relaxed);
         self.meter = 0.0;
         self.shared.voices.store(0, Ordering::Relaxed);
         self.shared.active_mask.store(0, Ordering::Relaxed);
+        self.shared.b_side_mask.store(0, Ordering::Relaxed);
         self.shared.peak_bits.store(0, Ordering::Relaxed);
         for slot in &self.shared.playhead_ppm {
             slot.store(u32::MAX, Ordering::Relaxed);
+        }
+        for slot in &self.shared.weather_ppm {
+            slot.store(0, Ordering::Relaxed);
         }
     }
 
@@ -525,10 +587,12 @@ impl Plugin for Hyperchroma {
             splatter: self.params.splatter.value(),
             escape: self.params.escape.value(),
             drift: self.params.drift.value(),
+            b_side: self.params.b_side.value(),
         });
         self.poll_preview(buffer.samples());
 
-        for (sample_id, channel_samples) in buffer.iter_samples().enumerate() {
+        let block = buffer.samples().min(self.dry_l.len());
+        for sample_id in 0..block {
             while let Some(event) = next_event {
                 if event.timing() > sample_id as u32 {
                     break;
@@ -567,10 +631,30 @@ impl Plugin for Hyperchroma {
                 next_event = context.next_event();
             }
 
+            let (dry_l, dry_r, wet_l, wet_r) = self.engine.render_buses(root, tempo_ratio, keytrack);
+            self.dry_l[sample_id] = dry_l;
+            self.dry_r[sample_id] = dry_r;
+            self.wet_l[sample_id] = wet_l;
+            self.wet_r[sample_id] = wet_r;
+        }
+
+        let splatter = self.params.splatter.value();
+        SpectralGate::process_block(
+            &mut self.gate,
+            &mut self.wet_l[..block],
+            &mut self.wet_r[..block],
+            &self.dry_l[..block],
+            &self.dry_r[..block],
+            splatter,
+        );
+
+        for (sample_id, channel_samples) in buffer.iter_samples().enumerate() {
+            if sample_id >= block {
+                break;
+            }
             let gain = util::db_to_gain(self.params.gain.smoothed.next());
-            let (left, right) = self.engine.render(root, tempo_ratio, keytrack);
-            let left = shape(left * gain * BUS_TRIM);
-            let right = shape(right * gain * BUS_TRIM);
+            let left = shape(self.wet_l[sample_id] * gain * BUS_TRIM);
+            let right = shape(self.wet_r[sample_id] * gain * BUS_TRIM);
             let mut channel_index = 0;
             for sample in channel_samples {
                 *sample = if channel_index == 0 { left } else { right };
@@ -593,14 +677,22 @@ impl Plugin for Hyperchroma {
         self.shared
             .active_mask
             .store(self.engine.active_mask(), Ordering::Relaxed);
+        self.shared
+            .b_side_mask
+            .store(self.engine.b_side_mask(), Ordering::Relaxed);
         let mut heads = [u32::MAX; SAMPLE_SLOTS];
+        let mut weather = [0u32; SAMPLE_SLOTS];
         let mut serials = [0u32; SAMPLE_SLOTS];
-        self.engine.write_playheads(&mut heads, &mut serials);
+        self.engine
+            .write_playheads(&mut heads, &mut weather, &mut serials);
         for (slot, head) in self.shared.playhead_ppm.iter().zip(heads) {
             slot.store(head, Ordering::Relaxed);
         }
+        for (slot, amount) in self.shared.weather_ppm.iter().zip(weather) {
+            slot.store(amount, Ordering::Relaxed);
+        }
 
-        if self.engine.any_active() || self.params.editor_state.is_open() {
+        if self.engine.any_active() || self.gate.is_active() || self.params.editor_state.is_open() {
             ProcessStatus::KeepAlive
         } else {
             ProcessStatus::Normal

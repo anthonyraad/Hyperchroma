@@ -98,7 +98,10 @@ fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
 }
 
 pub struct Bank {
+    /// A-sides, in `SAMPLE_NAMES` order when loaded from the embed.
     pub samples: Vec<Pcm>,
+    /// B-side for the same color index, when one was embedded.
+    pub b_sides: Vec<Option<Pcm>>,
     pub errors: Vec<String>,
 }
 
@@ -106,8 +109,22 @@ impl Bank {
     pub fn empty() -> Self {
         Self {
             samples: Vec::new(),
+            b_sides: Vec::new(),
             errors: Vec::new(),
         }
+    }
+
+    pub fn pcm(&self, index: usize, side_b: bool) -> Option<&Pcm> {
+        if side_b {
+            if let Some(Some(b)) = self.b_sides.get(index) {
+                return Some(b);
+            }
+        }
+        self.samples.get(index)
+    }
+
+    pub fn has_b(&self, index: usize) -> bool {
+        matches!(self.b_sides.get(index), Some(Some(pcm)) if pcm.frames > 8)
     }
 }
 
@@ -120,6 +137,8 @@ pub struct SampleInfo {
     pub seconds: f32,
     pub wave_min: Arc<[f32]>,
     pub wave_max: Arc<[f32]>,
+    pub wave_min_b: Option<Arc<[f32]>>,
+    pub wave_max_b: Option<Arc<[f32]>>,
 }
 
 #[derive(Clone, Default)]
@@ -131,19 +150,32 @@ pub struct BankSnapshot {
 impl Bank {
     pub fn snapshot(&self) -> BankSnapshot {
         BankSnapshot {
-            infos: self.samples.iter().map(sample_info).collect(),
+            infos: self
+                .samples
+                .iter()
+                .enumerate()
+                .map(|(index, sample)| {
+                    let (wave_min, wave_max) = waveform(sample);
+                    let (wave_min_b, wave_max_b) = match self.b_sides.get(index).and_then(|b| b.as_ref())
+                    {
+                        Some(b) => {
+                            let (mins, maxs) = waveform(b);
+                            (Some(Arc::from(mins)), Some(Arc::from(maxs)))
+                        }
+                        None => (None, None),
+                    };
+                    SampleInfo {
+                        name: sample.name.clone(),
+                        seconds: sample.seconds(),
+                        wave_min: Arc::from(wave_min),
+                        wave_max: Arc::from(wave_max),
+                        wave_min_b,
+                        wave_max_b,
+                    }
+                })
+                .collect(),
             errors: self.errors.clone(),
         }
-    }
-}
-
-fn sample_info(sample: &Pcm) -> SampleInfo {
-    let (wave_min, wave_max) = waveform(sample);
-    SampleInfo {
-        name: sample.name.clone(),
-        seconds: sample.seconds(),
-        wave_min: Arc::from(wave_min),
-        wave_max: Arc::from(wave_max),
     }
 }
 
@@ -208,22 +240,59 @@ fn smooth_loop(values: &mut [f32]) {
 }
 
 pub fn load_embedded() -> Bank {
-    let mut samples = Vec::new();
+    let mut a_sides = Vec::new();
+    let mut b_sides_raw = Vec::new();
     let mut errors = Vec::new();
     for asset in ASSETS {
         match decode(asset.name, asset.bytes) {
             Ok(mut pcm) => {
                 pcm.normalize(0.89);
-                samples.push(pcm);
+                if asset.name.ends_with("_b") {
+                    b_sides_raw.push(pcm);
+                } else {
+                    a_sides.push(pcm);
+                }
             }
             Err(error) => errors.push(format!("{}: {error}", asset.name)),
         }
     }
-    samples.sort_by_key(|sample| name_rank(&sample.name));
-    Bank { samples, errors }
+    a_sides.sort_by_key(|sample| name_rank(&sample.name));
+    // Keep only known A-sides in SAMPLE_NAMES order when present.
+    let mut samples = Vec::with_capacity(SAMPLE_NAMES.len());
+    for expected in SAMPLE_NAMES {
+        if let Some(index) = a_sides.iter().position(|sample| sample.name == *expected) {
+            samples.push(a_sides.remove(index));
+        }
+    }
+    // Unknown A-sides still ship after the named grid.
+    samples.append(&mut a_sides);
+
+    let mut b_sides: Vec<Option<Pcm>> = (0..samples.len()).map(|_| None).collect();
+    for mut pcm in b_sides_raw {
+        let Some(base) = pcm.name.strip_suffix("_b").map(str::to_string) else {
+            errors.push(format!("{}: B-side name is missing a color", pcm.name));
+            continue;
+        };
+        pcm.name = base.clone();
+        match samples.iter().position(|sample| sample.name == base) {
+            Some(index) => b_sides[index] = Some(pcm),
+            None => errors.push(format!("{base}_b: no matching A-side")),
+        }
+    }
+
+    Bank {
+        samples,
+        b_sides,
+        errors,
+    }
 }
 
 fn name_rank(name: &str) -> (usize, String) {
+    if let Some(base) = name.strip_suffix("_b") {
+        if let Some(index) = SAMPLE_NAMES.iter().position(|known| *known == base) {
+            return (index, "b".to_string());
+        }
+    }
     match SAMPLE_NAMES.iter().position(|known| *known == name) {
         Some(index) => (index, String::new()),
         None => (SAMPLE_NAMES.len(), name.to_string()),
@@ -395,6 +464,7 @@ mod tests {
             bank.errors
         );
         assert_eq!(bank.samples.len(), SAMPLE_NAMES.len());
+        assert_eq!(bank.b_sides.len(), SAMPLE_NAMES.len());
         for (sample, expected) in bank.samples.iter().zip(SAMPLE_NAMES) {
             assert_eq!(sample.name, *expected);
         }
@@ -408,6 +478,19 @@ mod tests {
             assert!(peak <= 0.92, "{} peak {peak}", sample.name);
             assert!(peak > 0.2, "{} was silent after normalize", sample.name);
         }
+        for (index, expected) in SAMPLE_NAMES.iter().enumerate() {
+            let b = bank.b_sides[index]
+                .as_ref()
+                .unwrap_or_else(|| panic!("missing B-side for {expected}"));
+            assert_eq!(b.name, *expected);
+            assert!(b.frames > 8, "{expected} B-side");
+            let peak = b
+                .data
+                .iter()
+                .fold(0.0f32, |peak, value| peak.max(value.abs()));
+            assert!(peak <= 0.92, "{expected} B peak {peak}");
+            assert!(peak > 0.2, "{expected} B was silent after normalize");
+        }
         let snap = bank.snapshot();
         assert_eq!(snap.infos.len(), SAMPLE_NAMES.len());
         for info in &snap.infos {
@@ -415,6 +498,14 @@ mod tests {
             assert_eq!(info.wave_max.len(), WAVE_BINS, "{}", info.name);
             let peak = info.wave_max.iter().copied().fold(0.0f32, f32::max);
             assert!(peak > 0.05, "{} waveform was silent", info.name);
+            let b_min = info
+                .wave_min_b
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} missing B waveform", info.name));
+            let b_max = info.wave_max_b.as_ref().unwrap();
+            assert_eq!(b_min.len(), WAVE_BINS, "{} B", info.name);
+            let peak_b = b_max.iter().copied().fold(0.0f32, f32::max);
+            assert!(peak_b > 0.05, "{} B waveform was silent", info.name);
         }
     }
 }
