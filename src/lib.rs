@@ -250,6 +250,24 @@ pub struct HyperchromaParams {
     #[id = "revfloor"]
     pub reverse_floor: FloatParam,
 
+    /// Chance a note pumps like a kick sidechain, in 5% steps.
+    #[id = "duck"]
+    pub duck: FloatParam,
+
+    /// Chance a note slowly drifts sharp and flat, in 5% steps.
+    #[id = "detune"]
+    pub detune: FloatParam,
+
+    /// Rates a ducked note may choose. At least a quarter note stays available.
+    #[id = "duck4"]
+    pub duck_quarter: BoolParam,
+
+    #[id = "duck2"]
+    pub duck_half: BoolParam,
+
+    #[id = "duck1"]
+    pub duck_whole: BoolParam,
+
     #[nested(id_prefix = "bug", group = "Poppy")]
     pub bug: SliceParams,
     #[nested(id_prefix = "dark", group = "Rosehip")]
@@ -452,6 +470,31 @@ impl Default for HyperchromaParams {
             .with_step_size(0.05)
             .with_value_to_string(Arc::new(percent_text))
             .with_string_to_value(Arc::new(percent_parse)),
+            duck: FloatParam::new(
+                "Ducking",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                },
+            )
+            .with_step_size(0.05)
+            .with_value_to_string(Arc::new(percent_text))
+            .with_string_to_value(Arc::new(percent_parse)),
+            detune: FloatParam::new(
+                "Detune",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 1.0,
+                },
+            )
+            .with_step_size(0.05)
+            .with_value_to_string(Arc::new(percent_text))
+            .with_string_to_value(Arc::new(percent_parse)),
+            duck_quarter: BoolParam::new("Duck 1/4", true),
+            duck_half: BoolParam::new("Duck 1/2", false),
+            duck_whole: BoolParam::new("Duck 1/1", false),
             bug: SliceParams::new(),
             dark: SliceParams::new(),
             dragon: SliceParams::new(),
@@ -596,7 +639,9 @@ impl Plugin for Hyperchroma {
             manual
         };
         let tempo_ratio = (target / sample_bpm).clamp(0.05, 8.0);
-        self.engine.set_clock(target);
+        let transport = context.transport();
+        self.engine
+            .locate(target, transport.pos_beats(), transport.playing);
         self.engine.set_global(GlobalRoll {
             swell: self.params.swell.value(),
             crush: self.params.crush.value(),
@@ -609,6 +654,11 @@ impl Plugin for Hyperchroma {
             b_side: self.params.b_side.value(),
             stereoentropic: self.params.stereoentropic.value(),
             reverse_floor: self.params.reverse_floor.value(),
+            duck: self.params.duck.value(),
+            detune: self.params.detune.value(),
+            duck_quarter: self.params.duck_quarter.value(),
+            duck_half: self.params.duck_half.value(),
+            duck_whole: self.params.duck_whole.value(),
         });
         self.poll_preview(buffer.samples());
 

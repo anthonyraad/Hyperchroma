@@ -17,6 +17,8 @@ const STONE: Color32 = Color32::from_rgb(120, 112, 100);
 const PAPER: Color32 = Color32::from_rgb(245, 240, 230);
 const POLLEN: Color32 = Color32::from_rgb(224, 186, 122);
 const LAVENDER: Color32 = Color32::from_rgb(186, 168, 214);
+const OLIVE: Color32 = Color32::from_rgb(188, 194, 142);
+const ASH: Color32 = Color32::from_rgb(174, 172, 166);
 const WARN: Color32 = Color32::from_rgb(214, 148, 110);
 
 /// Sound boxes are 15% narrower than the 117.6px boxes the 670px window used.
@@ -57,6 +59,10 @@ pub struct KbState {
     stereoentropic_edit: Option<PendingBool>,
     /// Follow-host-tempo edit the host has not applied yet.
     sync_edit: Option<PendingBool>,
+    /// Duck-rate edits the host has not applied yet.
+    duck_quarter_edit: Option<PendingBool>,
+    duck_half_edit: Option<PendingBool>,
+    duck_whole_edit: Option<PendingBool>,
 }
 
 impl KbState {
@@ -71,6 +77,9 @@ impl KbState {
             keytrack_edit: None,
             stereoentropic_edit: None,
             sync_edit: None,
+            duck_quarter_edit: None,
+            duck_half_edit: None,
+            duck_whole_edit: None,
         }
     }
 }
@@ -156,6 +165,9 @@ pub fn draw(
                     None,
                 );
                 settle_bool(setter, &params.sync, &mut kb.sync_edit, None);
+                settle_bool(setter, &params.duck_quarter, &mut kb.duck_quarter_edit, None);
+                settle_bool(setter, &params.duck_half, &mut kb.duck_half_edit, None);
+                settle_bool(setter, &params.duck_whole, &mut kb.duck_whole_edit, None);
             }
             if empty.clicked() {
                 kb.selected = None;
@@ -677,13 +689,14 @@ fn sample_peak(mins: &[f32], maxs: &[f32], index: f32) -> (f32, f32) {
     )
 }
 
-const DIAL: Color32 = Color32::from_rgb(0xf6, 0xf5, 0xfc);
-const DIAL_OUTLINE: Color32 = Color32::from_rgb(0x4a, 0x4a, 0x4a);
-const DIAL_TRACK: Color32 = Color32::from_rgb(0xba, 0xb5, 0xd1);
-const DIAL_ARC: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
-const DIAL_INK: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
-const ROTARY_START: f32 = std::f32::consts::PI * 1.2;
-const ROTARY_END: f32 = std::f32::consts::PI * 2.8;
+/// Faint full-sweep track. Darkens a little while the pointer is over the knob.
+const ARC_TRACK: Color32 = Color32::from_rgb(222, 214, 200);
+const ARC_TRACK_HOVER: Color32 = Color32::from_rgb(204, 196, 182);
+/// 7:30, then 270 degrees clockwise to 4:30. Angle 0 is 12 o'clock.
+const ARC_START: f32 = std::f32::consts::PI * 1.25;
+const ARC_SWEEP: f32 = std::f32::consts::PI * 1.5;
+const ARC_STROKE: f32 = 2.0;
+const ARC_DOT: f32 = 3.0;
 const KNOB_SLOT: f32 = 96.0;
 const VALUE_HOLD: f64 = 0.9;
 const DOUBLE_PRESS: f64 = 0.5;
@@ -848,7 +861,6 @@ struct PendingReset {
     open: bool,
 }
 
-/// Haunter's plain dial: a light disc, a track, an accent arc, and a dark pointer.
 /// Drag up to increase. Shift drags finer. Double-click returns the default.
 fn draw_knob(
     ui: &mut egui::Ui,
@@ -1016,50 +1028,28 @@ fn draw_knob(
 
     let dial = 70.0_f32.min(rect.width() - 8.0);
     let center = egui::pos2(rect.center().x, rect.top() + dial * 0.5 + 2.0);
-    let radius = dial * 0.5 - 3.0;
-    let angle = ROTARY_START + normalized * (ROTARY_END - ROTARY_START);
-    let painter = ui.painter();
-    painter.circle_filled(center, radius - 1.0, DIAL);
-    painter.circle_stroke(center, radius - 1.0, Stroke::new(1.0_f32, DIAL_OUTLINE));
-    painter.line(
-        arc_points(center, radius - 5.0, ROTARY_START, ROTARY_END),
-        Stroke::new(2.0_f32, DIAL_TRACK),
+    // The old disc was stroked on this radius. The arc keeps it so the slot stays put.
+    let radius = dial * 0.5 - 4.0;
+    draw_arc_knob(
+        ui.painter(),
+        center,
+        radius,
+        normalized,
+        bipolar,
+        response.hovered() || response.dragged(),
+        ui.is_enabled(),
     );
-    if bipolar {
-        let mid = ROTARY_START + 0.5 * (ROTARY_END - ROTARY_START);
-        if (angle - mid).abs() > 0.02 {
-            let (from, to) = if angle < mid { (angle, mid) } else { (mid, angle) };
-            painter.line(
-                arc_points(center, radius - 5.0, from, to),
-                Stroke::new(2.0_f32, DIAL_ARC),
-            );
-        }
-    } else if normalized > 0.004 {
-        painter.line(
-            arc_points(center, radius - 5.0, ROTARY_START, angle),
-            Stroke::new(2.0_f32, DIAL_ARC),
-        );
-    }
-    let inner = egui::pos2(
-        center.x + angle.sin() * dial * 0.18,
-        center.y - angle.cos() * dial * 0.18,
-    );
-    let outer = egui::pos2(
-        center.x + angle.sin() * dial * 0.36,
-        center.y - angle.cos() * dial * 0.36,
-    );
-    painter.line_segment([inner, outer], Stroke::new(1.6_f32, DIAL_INK));
 
     if value_visible {
-        painter.text(
+        ui.painter().text(
             center,
             egui::Align2::CENTER_CENTER,
             dial_readout(&readout),
             egui::FontId::proportional(11.0),
-            DIAL_INK,
+            INK,
         );
     }
-    painter.text(
+    ui.painter().text(
         egui::pos2(rect.center().x, rect.top() + dial + 12.0),
         egui::Align2::CENTER_CENTER,
         name.to_uppercase(),
@@ -1103,15 +1093,61 @@ fn knob_help(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Track plus the ink arc and position dot. Global and color knobs both call this.
+fn draw_arc_knob(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    normalized: f32,
+    bipolar: bool,
+    hovered: bool,
+    enabled: bool,
+) {
+    let normalized = normalized.clamp(0.0, 1.0);
+    let angle = ARC_START + normalized * ARC_SWEEP;
+    let track = if hovered { ARC_TRACK_HOVER } else { ARC_TRACK };
+    let ink = if enabled {
+        INK
+    } else {
+        Color32::from_rgba_unmultiplied(24, 32, 28, 90)
+    };
+    painter.line(
+        arc_points(center, radius, ARC_START, ARC_START + ARC_SWEEP),
+        Stroke::new(ARC_STROKE, track),
+    );
+    let origin = if bipolar {
+        ARC_START + ARC_SWEEP * 0.5
+    } else {
+        ARC_START
+    };
+    if (angle - origin).abs() > 0.004 {
+        let (from, to) = if angle < origin {
+            (angle, origin)
+        } else {
+            (origin, angle)
+        };
+        painter.line(
+            arc_points(center, radius, from, to),
+            Stroke::new(ARC_STROKE, ink),
+        );
+    }
+    painter.circle_filled(arc_point(center, radius, angle), ARC_DOT, ink);
+}
+
+fn arc_point(center: egui::Pos2, radius: f32, angle: f32) -> egui::Pos2 {
+    egui::pos2(
+        center.x + angle.sin() * radius,
+        center.y - angle.cos() * radius,
+    )
+}
+
 fn arc_points(center: egui::Pos2, radius: f32, start: f32, end: f32) -> Vec<egui::Pos2> {
-    let steps = (((end - start).abs() / 0.09).ceil() as i32).max(2);
+    let span = (end - start).abs();
+    let steps = ((span * radius) / 1.25).ceil().max(12.0) as i32;
     (0..=steps)
         .map(|step| {
             let angle = start + (end - start) * (step as f32 / steps as f32);
-            egui::pos2(
-                center.x + angle.sin() * radius,
-                center.y - angle.cos() * radius,
-            )
+            arc_point(center, radius, angle)
         })
         .collect()
 }
@@ -1188,6 +1224,51 @@ fn shaping(
             widgets::ParamSlider::for_param(&params.reverse_floor, setter).with_width(SLIDER_W),
         );
     });
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        slider_caption(ui, "Detune", caption_w);
+        ui.visuals_mut().selection.bg_fill = OLIVE;
+        ui.add(
+            widgets::ParamSlider::for_param(&params.detune, setter)
+                .with_width(SLIDER_W)
+                .without_value(),
+        );
+        percent_readout(ui, &params.detune);
+    });
+
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        slider_caption(ui, "Ducking", caption_w);
+        ui.visuals_mut().selection.bg_fill = ASH;
+        ui.add(
+            widgets::ParamSlider::for_param(&params.duck, setter)
+                .with_width(SLIDER_W)
+                .without_value(),
+        );
+        percent_readout(ui, &params.duck);
+        duck_rates(ui, setter, kb, params);
+    });
+}
+
+/// Percent for a settings slider, in a slot sized for `100%`.
+/// The settings window is anchored on the right and shrinks to its contents, so a
+/// narrower readout would slide the whole panel under the cursor while dragging.
+fn percent_readout(ui: &mut egui::Ui, param: &impl Param) {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap("100%".to_owned(), font.clone(), INK)
+            .size()
+            .x
+    });
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Sense::hover(),
+    );
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(param.to_string(), font, INK));
+    let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
+    ui.painter().galley(pos, galley, INK);
 }
 
 /// Left caption for a settings slider. The slot is wide enough for the longest
@@ -1205,6 +1286,127 @@ fn slider_caption(ui: &mut egui::Ui, text: &str, width: f32) {
             ui.label(RichText::new(text).size(12.0).color(STONE));
         },
     );
+}
+
+/// Closed label for the duck-rate menu. An empty selection still reads as a
+/// quarter note, which is the rate the engine uses in that case.
+fn duck_rate_label(quarter: bool, half: bool, whole: bool) -> String {
+    let mut parts = Vec::new();
+    if quarter {
+        parts.push("1/4");
+    }
+    if half {
+        parts.push("1/2");
+    }
+    if whole {
+        parts.push("1/1");
+    }
+    if parts.is_empty() {
+        "1/4".to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn duck_rates(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    kb: &mut KbState,
+    params: &HyperchromaParams,
+) {
+    let show_quarter = kb
+        .duck_quarter_edit
+        .map(|edit| edit.target)
+        .unwrap_or_else(|| params.duck_quarter.value());
+    let show_half = kb
+        .duck_half_edit
+        .map(|edit| edit.target)
+        .unwrap_or_else(|| params.duck_half.value());
+    let show_whole = kb
+        .duck_whole_edit
+        .map(|edit| edit.target)
+        .unwrap_or_else(|| params.duck_whole.value());
+    let popup_id = ui.make_persistent_id("hyperchroma-duck-rates");
+    let open = ui.memory(|mem| mem.is_popup_open(popup_id));
+    let response = duck_rate_button(
+        ui,
+        &duck_rate_label(show_quarter, show_half, show_whole),
+        open,
+    );
+    if response.clicked() {
+        ui.memory_mut(|mem| mem.toggle_popup(popup_id));
+    }
+
+    let mut quarter_clicked = None;
+    let mut half_clicked = None;
+    let mut whole_clicked = None;
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &response,
+        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.visuals_mut().override_text_color = Some(INK);
+            ui.set_min_width(88.0);
+            quarter_clicked = duck_rate_check(ui, "1/4", show_quarter, show_half || show_whole);
+            half_clicked = duck_rate_check(ui, "1/2", show_half, show_quarter || show_whole);
+            whole_clicked = duck_rate_check(ui, "1/1", show_whole, show_quarter || show_half);
+        },
+    );
+    settle_bool(
+        setter,
+        &params.duck_quarter,
+        &mut kb.duck_quarter_edit,
+        quarter_clicked,
+    );
+    settle_bool(
+        setter,
+        &params.duck_half,
+        &mut kb.duck_half_edit,
+        half_clicked,
+    );
+    settle_bool(
+        setter,
+        &params.duck_whole,
+        &mut kb.duck_whole_edit,
+        whole_clicked,
+    );
+}
+
+/// One row of the rate menu. Unchecking the last rate is ignored.
+fn duck_rate_check(ui: &mut egui::Ui, label: &str, current: bool, others: bool) -> Option<bool> {
+    let mut value = current;
+    if ui.checkbox(&mut value, label).changed() && (value || others) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn duck_rate_button(ui: &mut egui::Ui, label: &str, open: bool) -> egui::Response {
+    let font = egui::FontId::proportional(12.0);
+    let width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap("1/4 · 1/2 · 1/1".to_owned(), font.clone(), STONE)
+            .size()
+            .x
+    }) + 14.0;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Sense::click(),
+    );
+    if open || response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            2.0,
+            Color32::from_rgba_unmultiplied(224, 186, 122, 40),
+        );
+    }
+    let color = if open || response.hovered() { INK } else { STONE };
+    let galley = ui.fonts(|fonts| fonts.layout_no_wrap(label.to_owned(), font, color));
+    let pos = egui::pos2(rect.left() + 4.0, rect.center().y - galley.size().y * 0.5);
+    ui.painter().galley(pos, galley, color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn knob(ui: &mut egui::Ui, setter: &ParamSetter, label: &str, param: &impl Param) {
@@ -1311,30 +1513,30 @@ fn color_label(name: &str) -> &'static str {
 
 fn tile_color(name: &str) -> Color32 {
     match name {
-        "bug" => Color32::from_rgb(0xc8, 0x46, 0x3d),
-        "dark" => Color32::from_rgb(0xb5, 0x41, 0x6f),
-        "dragon" => Color32::from_rgb(0xd9, 0x8b, 0xa8),
-        "electric" => Color32::from_rgb(0xe8, 0x94, 0x74),
-        "fairy" => Color32::from_rgb(0xd9, 0x69, 0x2e),
-        "fighting" => Color32::from_rgb(0xe3, 0xa7, 0x2f),
-        "fire" => Color32::from_rgb(0xe8, 0xd3, 0x5e),
-        "flying" => Color32::from_rgb(0xa2, 0xb4, 0x55),
-        "ghost" => Color32::from_rgb(0x4f, 0x8f, 0x45),
-        "grass" => Color32::from_rgb(0x2e, 0x5e, 0x4e),
-        "ground" => Color32::from_rgb(0x5f, 0xa5, 0x93),
-        "ice" => Color32::from_rgb(0x3a, 0x7e, 0x9e),
-        "normal" => Color32::from_rgb(0x4a, 0x8f, 0xdb),
-        "poison" => Color32::from_rgb(0x5b, 0x5b, 0xae),
-        "psychic" => Color32::from_rgb(0xb5, 0x9c, 0xdb),
-        "rock" => Color32::from_rgb(0xa1, 0x5b, 0xb0),
-        "steel" => Color32::from_rgb(0x5a, 0x34, 0x56),
-        "water" => Color32::from_rgb(0x8a, 0x4f, 0x2e),
-        "sage" => Color32::from_rgb(0xb8, 0xac, 0x92),
-        "clay" => Color32::from_rgb(0x2b, 0x3f, 0x78),
-        "mulberry" => Color32::from_rgb(0x7a, 0x2e, 0x48),
-        "olive" => Color32::from_rgb(0x7a, 0x78, 0x40),
-        "aloe" => Color32::from_rgb(0xa3, 0xd0, 0xc4),
-        "cinnamon" => Color32::from_rgb(0xc1, 0x7a, 0x4e),
+        "bug" => Color32::from_rgb(0xb5, 0x65, 0x5a),
+        "dark" => Color32::from_rgb(0xe3, 0xaf, 0xbd),
+        "dragon" => Color32::from_rgb(0xd9, 0xb2, 0xa9),
+        "electric" => Color32::from_rgb(0xd8, 0x9a, 0x78),
+        "fairy" => Color32::from_rgb(0xc4, 0x7b, 0x4e),
+        "mulberry" => Color32::from_rgb(0x7e, 0x4e, 0x57),
+        "fighting" => Color32::from_rgb(0xc9, 0xa1, 0x5b),
+        "fire" => Color32::from_rgb(0xdc, 0xcb, 0x8e),
+        "flying" => Color32::from_rgb(0xa8, 0xaf, 0x7c),
+        "ghost" => Color32::from_rgb(0x7e, 0x98, 0x73),
+        "grass" => Color32::from_rgb(0x4f, 0x6b, 0x5c),
+        "olive" => Color32::from_rgb(0x8a, 0x84, 0x60),
+        "ground" => Color32::from_rgb(0x7f, 0xa7, 0x9a),
+        "ice" => Color32::from_rgb(0x5e, 0x85, 0x95),
+        "normal" => Color32::from_rgb(0x8f, 0xa9, 0xc4),
+        "poison" => Color32::from_rgb(0x7c, 0x7a, 0xa3),
+        "psychic" => Color32::from_rgb(0xb7, 0xa8, 0xc9),
+        "aloe" => Color32::from_rgb(0xb8, 0xcc, 0xc2),
+        "rock" => Color32::from_rgb(0x9c, 0x7a, 0xa0),
+        "steel" => Color32::from_rgb(0x5e, 0x4a, 0x5c),
+        "water" => Color32::from_rgb(0x8a, 0x65, 0x50),
+        "sage" => Color32::from_rgb(0xc9, 0xbc, 0xa5),
+        "clay" => Color32::from_rgb(0x3f, 0x50, 0x68),
+        "cinnamon" => Color32::from_rgb(0xb8, 0x8b, 0x6e),
         _ => Color32::from_rgb(70, 96, 84),
     }
 }

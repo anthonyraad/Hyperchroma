@@ -79,6 +79,14 @@ pub struct GlobalRoll {
     pub stereoentropic: bool,
     /// Reverse chance used only when a color's Reverse knob is at zero.
     pub reverse_floor: f32,
+    /// Chance a note pumps like a kick sidechain.
+    pub duck: f32,
+    /// Chance a note slowly drifts sharp and flat.
+    pub detune: f32,
+    /// Which musical divisions a ducked note may pump on.
+    pub duck_quarter: bool,
+    pub duck_half: bool,
+    pub duck_whole: bool,
 }
 
 impl GlobalRoll {
@@ -95,8 +103,25 @@ impl GlobalRoll {
             b_side: 0.0,
             stereoentropic: false,
             reverse_floor: 0.0,
+            duck: 0.0,
+            detune: 0.0,
+            duck_quarter: true,
+            duck_half: false,
+            duck_whole: false,
         }
     }
+}
+
+/// How fast a ducked note pumps. Chosen once, from the rates left checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DuckRate {
+    Off,
+    /// One beat. A quarter note in 4/4.
+    Quarter,
+    /// Two beats.
+    Half,
+    /// Four beats.
+    Whole,
 }
 
 /// Per-recording chances, decided once when a note starts.
@@ -145,6 +170,14 @@ struct Voice {
     serial: u32,
     until_next: usize,
     reverse: bool,
+    /// Kick-style pump for this note. `Off` leaves the level alone.
+    duck: DuckRate,
+    /// Peak cents of this note's detune LFO. `0` keeps the pitch still.
+    detune_cents: f32,
+    /// Detune LFO rate in hertz.
+    detune_hz: f32,
+    /// Detune LFO phase in radians.
+    detune_phase: f32,
     /// Stereo placement for the note, `-1` hard left to `1` hard right. `0` keeps the recording.
     pan: f32,
     /// Where this note's stereo started, and where Drift walks it.
@@ -236,6 +269,10 @@ impl Voice {
             serial: 0,
             until_next: 0,
             reverse: false,
+            duck: DuckRate::Off,
+            detune_cents: 0.0,
+            detune_hz: 0.0,
+            detune_phase: 0.0,
             pan: 0.0,
             pan_from: 0.0,
             pan_to: 0.0,
@@ -366,6 +403,10 @@ pub struct Engine {
     next_serial: u32,
     global: GlobalRoll,
     clock_bpm: f32,
+    /// Song position in quarter notes at the sample about to be rendered.
+    clock_beats: f64,
+    /// Quarter notes advanced by one output sample.
+    clock_step: f64,
     /// Remaining crush degrees, dealt in a shuffled order.
     crush_bag: [CrushDegree; 3],
     crush_left: u8,
@@ -396,6 +437,8 @@ impl Engine {
             next_serial: 1,
             global: GlobalRoll::off(),
             clock_bpm: 120.0,
+            clock_beats: 0.0,
+            clock_step: 0.0,
             crush_bag: [CrushDegree::Little, CrushDegree::Moderate, CrushDegree::Lot],
             crush_left: 0,
             smear_bag: [SmearDegree::Little, SmearDegree::Moderate, SmearDegree::Lot],
@@ -440,6 +483,7 @@ impl Engine {
             .saturating_mul(ESCAPE_REGIONS)
             .saturating_mul(MAX_VOICES);
         self.escape_buf = vec![0.0; escape_cells];
+        self.refresh_clock_step();
         self.silence();
     }
 
@@ -480,13 +524,35 @@ impl Engine {
         self.global = roll;
     }
 
-    /// Musical clock in BPM. Stutter divisions are measured against it.
+    /// Musical clock in BPM. Stutter divisions and ducking are measured against it.
     pub fn set_clock(&mut self, bpm: f32) {
         self.clock_bpm = if bpm.is_finite() {
             bpm.clamp(20.0, 400.0)
         } else {
             120.0
         };
+        self.refresh_clock_step();
+    }
+
+    /// Place the ducking clock. While the host is playing, pumps lock to the song
+    /// so every ducked note hears the same kick. While stopped, the clock keeps
+    /// running from wherever it was so a held note still breathes.
+    pub fn locate(&mut self, bpm: f32, pos_beats: Option<f64>, playing: bool) {
+        self.set_clock(bpm);
+        if playing {
+            if let Some(pos) = pos_beats.filter(|pos| pos.is_finite()) {
+                self.clock_beats = pos;
+            }
+        }
+    }
+
+    fn refresh_clock_step(&mut self) {
+        let rate = if self.sample_rate.is_finite() && self.sample_rate > 1.0 {
+            self.sample_rate as f64
+        } else {
+            44_100.0
+        };
+        self.clock_step = self.clock_bpm as f64 / 60.0 / rate;
     }
 
     pub fn note_on(
@@ -772,6 +838,8 @@ impl Engine {
         } else {
             pan
         };
+        let duck = self.pick_duck();
+        let (detune_cents, detune_hz, detune_phase) = self.roll_detune();
 
         let slot = self.allocate_voice();
         let serial = self.next_serial;
@@ -787,6 +855,10 @@ impl Engine {
         voice.serial = serial;
         voice.until_next = 0;
         voice.reverse = reverse;
+        voice.duck = duck;
+        voice.detune_cents = detune_cents;
+        voice.detune_hz = detune_hz;
+        voice.detune_phase = detune_phase;
         voice.pan = pan;
         voice.pan_from = pan;
         voice.pan_to = pan_to;
@@ -953,6 +1025,7 @@ impl Engine {
             wet_l += voice_l * send;
             wet_r += voice_r * send;
         }
+        self.clock_beats += self.clock_step;
         (finite_sample(dry_l), finite_sample(dry_r), finite_sample(wet_l), finite_sample(wet_r))
     }
 
@@ -1130,12 +1203,20 @@ impl Engine {
         if octave_up {
             pitch *= 2.0;
         }
+        // Bend the slice clock by the same cents as the read rate. Leaving the
+        // clock on tempo lets the grain overlap phase-lock the pitch back.
+        let cents = self.sample_detune(index);
+        let bend = if cents.abs() > 1.0e-3 {
+            cents_ratio(cents)
+        } else {
+            1.0
+        };
+        pitch *= bend;
+        let schedule = if octave_up { pitch } else { tempo_ratio * bend };
         let read_inc = pitch as f64 * sr_ratio * direction;
         // A leap keeps the playhead with the doubled read, so the slices overlap
         // on the waveform. Leaving the playhead at the tempo puts each new slice
         // about 40 ms away from the one already sounding, and that overlap combs.
-        let schedule = if octave_up { pitch } else { tempo_ratio };
-
         if self.voices[index].smear && !self.voices[index].drift {
             return self.render_smear(
                 index,
@@ -1343,7 +1424,58 @@ impl Engine {
         };
         let env = voice.env;
         let (left, right) = (left * env * bloom, right * env * bloom);
-        self.escape_mix(index, left, right)
+        let (left, right) = self.escape_mix(index, left, right);
+        let duck = duck_gain(self.clock_beats, self.voices[index].duck, self.clock_bpm);
+        (left * duck, right * duck)
+    }
+
+    /// Cents offset for this sample, then advance the LFO. `0` when the note is steady.
+    fn sample_detune(&mut self, index: usize) -> f32 {
+        let depth = self.voices[index].detune_cents;
+        if depth <= 0.0 {
+            return 0.0;
+        }
+        let phase = self.voices[index].detune_phase;
+        let step = std::f32::consts::TAU * self.voices[index].detune_hz / self.sample_rate.max(1.0);
+        self.voices[index].detune_phase = (phase + step).rem_euclid(std::f32::consts::TAU);
+        depth * phase.sin()
+    }
+
+    /// A caught note wanders at one slow rate and one depth, both chosen once.
+    fn roll_detune(&mut self) -> (f32, f32, f32) {
+        if !fired(&mut self.rng, self.global.detune) {
+            return (0.0, 0.0, 0.0);
+        }
+        let cents = 5.0 + self.rng.unit() * 7.0;
+        let hz = 0.1 + self.rng.unit() * 0.4;
+        let phase = self.rng.unit() * std::f32::consts::TAU;
+        (cents, hz, phase)
+    }
+
+    fn pick_duck(&mut self) -> DuckRate {
+        if !fired(&mut self.rng, self.global.duck) {
+            return DuckRate::Off;
+        }
+        let rates = [
+            (self.global.duck_quarter, DuckRate::Quarter),
+            (self.global.duck_half, DuckRate::Half),
+            (self.global.duck_whole, DuckRate::Whole),
+        ];
+        let count = rates.iter().filter(|(on, _)| *on).count();
+        if count == 0 {
+            return DuckRate::Quarter;
+        }
+        let mut pick = (self.rng.unit() * count as f32).floor() as usize;
+        for (on, rate) in rates {
+            if !on {
+                continue;
+            }
+            if pick == 0 {
+                return rate;
+            }
+            pick -= 1;
+        }
+        DuckRate::Quarter
     }
 
     fn roll_pass(&mut self, chance: f32) -> (PassMode, f32) {
@@ -1791,6 +1923,44 @@ fn place(left: f32, right: f32, pan: f32) -> (f32, f32) {
 /// How long a swell takes to rise from silence, in seconds.
 const SWELL_SECONDS: f32 = 1.15;
 
+/// Depth of a kick pump. The note stays present, but the hit is obvious.
+const DUCK_FLOOR: f32 = 0.16;
+/// How long the level takes to fall after the kick, in seconds.
+const DUCK_ATTACK_SEC: f64 = 0.005;
+
+/// Sidechain curve for one ducked note. `pos_beats` is the song position in
+/// quarter notes. The gain is full just before a division, falls in a few
+/// milliseconds, then swells back across the rest of that division.
+fn duck_gain(pos_beats: f64, rate: DuckRate, bpm: f32) -> f32 {
+    let period = match rate {
+        DuckRate::Off => return 1.0,
+        DuckRate::Quarter => 1.0,
+        DuckRate::Half => 2.0,
+        DuckRate::Whole => 4.0,
+    };
+    let bpm = if bpm.is_finite() && bpm > 1.0 {
+        bpm as f64
+    } else {
+        120.0
+    };
+    let pos = if pos_beats.is_finite() { pos_beats } else { 0.0 };
+    let phase = pos.rem_euclid(period);
+    let attack = (DUCK_ATTACK_SEC * bpm / 60.0).clamp(0.001, period * 0.2);
+    if phase < attack {
+        let t = (phase / attack) as f32;
+        let t = t * t * (3.0 - 2.0 * t);
+        1.0 + (DUCK_FLOOR - 1.0) * t
+    } else {
+        let u = ((phase - attack) / (period - attack)) as f32;
+        let u = u.clamp(0.0, 1.0);
+        // Squared so the note stays down through the division and only
+        // swells back as the next hit approaches. A fast exponential made
+        // 1/4 and 1/1 both sound like a short tick.
+        let rise = u * u;
+        DUCK_FLOOR + (1.0 - DUCK_FLOOR) * rise
+    }
+}
+
 fn fired(rng: &mut Rng, chance: f32) -> bool {
     let chance = if chance.is_finite() {
         chance.clamp(0.0, 1.0)
@@ -2093,6 +2263,10 @@ fn bloom_window(age: usize, len: usize) -> f32 {
 
 /// C4 is the untransposed pitch of the recordings.
 const SAMPLE_MIDI: f32 = 60.0;
+
+fn cents_ratio(cents: f32) -> f32 {
+    2.0f32.powf(cents / 1200.0)
+}
 
 fn pitch_ratio(note: u8, root: i32, tuning: f32, keytrack: bool) -> f32 {
     let semis = if keytrack {
@@ -3211,5 +3385,291 @@ mod tests {
         note_with_charm(&mut quiet, 1.0);
         let voice = &quiet.voices[0];
         assert!(!voice.escape && !voice.crush && !voice.smear && !voice.drift);
+    }
+
+    #[test]
+    fn ducking_is_off_until_the_chance_catches_the_note() {
+        let mut dry = Engine::new(44_100.0, tone_bank(), 5);
+        dry.set_global(GlobalRoll {
+            duck: 0.0,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut dry, 0.2);
+        assert_eq!(dry.voices[0].duck, DuckRate::Off);
+
+        let mut pumped = Engine::new(44_100.0, tone_bank(), 5);
+        pumped.set_global(GlobalRoll {
+            duck: 1.0,
+            duck_quarter: true,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut pumped, 0.2);
+        assert_eq!(pumped.voices[0].duck, DuckRate::Quarter);
+    }
+
+    #[test]
+    fn a_ducked_note_picks_one_of_the_checked_rates() {
+        let mut engine = Engine::new(44_100.0, tone_bank(), 9);
+        engine.set_global(GlobalRoll {
+            duck: 1.0,
+            duck_quarter: true,
+            duck_half: false,
+            duck_whole: true,
+            ..GlobalRoll::off()
+        });
+        let mut saw_quarter = false;
+        let mut saw_whole = false;
+        for note in 0..12 {
+            engine.silence();
+            engine
+                .note_on(
+                    NoteOn {
+                        note: 48 + note,
+                        velocity: 1.0,
+                        channel: 0,
+                        voice_id: None,
+                        sample: Some(0),
+                        start_norm: Some(0.2),
+                    },
+                    &[1.0, 1.0],
+                    &[],
+                    1.0,
+                )
+                .unwrap();
+            match engine.voices[0].duck {
+                DuckRate::Quarter => saw_quarter = true,
+                DuckRate::Whole => saw_whole = true,
+                other => panic!("ducked note landed on {other:?}"),
+            }
+        }
+        assert!(saw_quarter && saw_whole, "both checked rates should come up");
+    }
+
+    #[test]
+    fn ducking_dips_on_the_beat_and_swells_back() {
+        let late = duck_gain(0.9, DuckRate::Quarter, 120.0);
+        let whole_then = duck_gain(0.9, DuckRate::Whole, 120.0);
+        let half_then = duck_gain(0.9, DuckRate::Half, 120.0);
+        assert!(late > 0.7, "a quarter note should be back before the next beat, {late}");
+        assert!(
+            half_then < 0.5,
+            "a half note should still be down one beat in, {half_then}"
+        );
+        assert!(
+            whole_then < 0.35,
+            "a whole note should still be down one beat in, {whole_then}"
+        );
+
+        let mut dry = Engine::new(44_100.0, tone_bank(), 4);
+        let mut quarter = Engine::new(44_100.0, tone_bank(), 4);
+        let mut whole = Engine::new(44_100.0, tone_bank(), 4);
+        for engine in [&mut dry, &mut quarter, &mut whole] {
+            engine.locate(120.0, Some(0.0), true);
+        }
+        quarter.set_global(GlobalRoll {
+            duck: 1.0,
+            duck_quarter: true,
+            duck_half: false,
+            duck_whole: false,
+            ..GlobalRoll::off()
+        });
+        whole.set_global(GlobalRoll {
+            duck: 1.0,
+            duck_quarter: false,
+            duck_half: false,
+            duck_whole: true,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut dry, 0.25);
+        hold_first(&mut quarter, 0.25);
+        hold_first(&mut whole, 0.25);
+
+        let mut dry_dip = 0.0f32;
+        let mut quarter_dip = 0.0f32;
+        for _ in 0..1_200 {
+            dry_dip += dry.render(60, 1.0, true).0.abs();
+            quarter_dip += quarter.render(60, 1.0, true).0.abs();
+            whole.render(60, 1.0, true);
+        }
+        // 120 BPM: one beat is 22_050 samples. Listen near the end of that beat.
+        let rest = 22_050 - 1_200 - 1_500;
+        for _ in 0..rest {
+            dry.render(60, 1.0, true);
+            quarter.render(60, 1.0, true);
+            whole.render(60, 1.0, true);
+        }
+        let mut quarter_late = 0.0f32;
+        let mut whole_late = 0.0f32;
+        for _ in 0..1_500 {
+            quarter_late += quarter.render(60, 1.0, true).0.abs();
+            whole_late += whole.render(60, 1.0, true).0.abs();
+        }
+        assert!(
+            quarter_dip < dry_dip * 0.45,
+            "the kick should pull the note down, pumped {quarter_dip} dry {dry_dip}"
+        );
+        assert!(
+            quarter_late > quarter_dip * 2.5,
+            "1/4 should have swelled back by the next beat, late {quarter_late} dip {quarter_dip}"
+        );
+        assert!(
+            whole_late < quarter_late * 0.45,
+            "1/1 should still be ducked one beat later, whole {whole_late} quarter {quarter_late}"
+        );
+    }
+
+    #[test]
+    fn detune_is_off_until_the_chance_catches_the_note() {
+        let mut dry = Engine::new(44_100.0, tone_bank(), 6);
+        dry.set_global(GlobalRoll {
+            detune: 0.0,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut dry, 0.2);
+        assert_eq!(dry.voices[0].detune_cents, 0.0);
+
+        let mut wandering = Engine::new(44_100.0, tone_bank(), 6);
+        wandering.set_global(GlobalRoll {
+            detune: 1.0,
+            ..GlobalRoll::off()
+        });
+        for note in 0..16 {
+            wandering.silence();
+            wandering
+                .note_on(
+                    NoteOn {
+                        note: 48 + note,
+                        velocity: 1.0,
+                        channel: 0,
+                        voice_id: None,
+                        sample: Some(0),
+                        start_norm: Some(0.2),
+                    },
+                    &[1.0, 1.0],
+                    &[],
+                    1.0,
+                )
+                .unwrap();
+            let voice = &wandering.voices[0];
+            assert!(
+                (5.0..=12.0).contains(&voice.detune_cents),
+                "depth should sit between 5 and 12 cents, got {}",
+                voice.detune_cents
+            );
+            assert!(
+                (0.1..=0.5).contains(&voice.detune_hz),
+                "the lfo should sit between 0.1 and 0.5 hz, got {}",
+                voice.detune_hz
+            );
+        }
+    }
+
+    /// Mean period of rising zero crossings. Finer than counting crossings in a window.
+    fn rising_hz(samples: &[f32], sample_rate: f32) -> f32 {
+        let mut times = Vec::new();
+        for (index, pair) in samples.windows(2).enumerate() {
+            if pair[0] <= 0.0 && pair[1] > 0.0 {
+                let slope = pair[1] - pair[0];
+                let frac = if slope.abs() > 1.0e-8 {
+                    -pair[0] / slope
+                } else {
+                    0.0
+                };
+                times.push(index as f32 + frac);
+            }
+        }
+        if times.len() < 8 {
+            return 0.0;
+        }
+        let periods: f32 = times.windows(2).map(|pair| pair[1] - pair[0]).sum();
+        let mean = periods / (times.len() - 1) as f32;
+        sample_rate / mean
+    }
+
+    #[test]
+    fn detune_raises_and_lowers_the_sounding_pitch() {
+        fn render_at(cents: f32, phase: f32) -> Vec<f32> {
+            let mut engine = Engine::new(44_100.0, tone_bank(), 4);
+            engine.set_global(GlobalRoll {
+                detune: 1.0,
+                ..GlobalRoll::off()
+            });
+            hold_first(&mut engine, 0.0);
+            engine.voices[0].detune_cents = cents;
+            engine.voices[0].detune_hz = 0.0;
+            engine.voices[0].detune_phase = phase;
+            let mut samples = Vec::with_capacity(44_100);
+            for _ in 0..44_100 {
+                samples.push(engine.render(60, 1.0, true).0);
+            }
+            samples
+        }
+        let dry = render_at(0.0, 0.0);
+        let sharp = render_at(12.0, std::f32::consts::FRAC_PI_2);
+        let flat = render_at(12.0, std::f32::consts::FRAC_PI_2 + std::f32::consts::PI);
+        let dry_hz = rising_hz(&dry, 44_100.0);
+        let sharp_hz = rising_hz(&sharp, 44_100.0);
+        let flat_hz = rising_hz(&flat, 44_100.0);
+        assert!(
+            sharp_hz > dry_hz + 1.0,
+            "twelve cents sharp should sit above the dry pitch, sharp {sharp_hz} dry {dry_hz}"
+        );
+        assert!(
+            flat_hz < dry_hz - 1.0,
+            "twelve cents flat should sit below the dry pitch, flat {flat_hz} dry {dry_hz}"
+        );
+    }
+
+    #[test]
+    fn detune_lfo_swings_sharp_and_flat() {
+        let up = cents_ratio(10.0);
+        let down = cents_ratio(-10.0);
+        assert!((up - 1.005_773).abs() < 0.000_2, "ten cents sharp, got {up}");
+        assert!((down - 0.994_240).abs() < 0.000_2, "ten cents flat, got {down}");
+
+        let mut engine = Engine::new(44_100.0, tone_bank(), 4);
+        hold_first(&mut engine, 0.0);
+        engine.voices[0].detune_cents = 8.0;
+        engine.voices[0].detune_hz = 0.25;
+        engine.voices[0].detune_phase = 0.0;
+        let mut lowest = 8.0f32;
+        let mut highest = -8.0f32;
+        for _ in 0..(44_100 * 4) {
+            let cents = engine.sample_detune(0);
+            lowest = lowest.min(cents);
+            highest = highest.max(cents);
+        }
+        assert!(
+            highest > 7.5,
+            "the lfo should reach near +8 cents, got {highest}"
+        );
+        assert!(
+            lowest < -7.5,
+            "the lfo should reach near -8 cents, got {lowest}"
+        );
+    }
+
+    #[test]
+    fn detune_lfo_is_audible_on_a_held_tone() {
+        let mut engine = Engine::new(44_100.0, tone_bank(), 4);
+        engine.set_global(GlobalRoll {
+            detune: 1.0,
+            ..GlobalRoll::off()
+        });
+        hold_first(&mut engine, 0.0);
+        engine.voices[0].detune_cents = 12.0;
+        engine.voices[0].detune_hz = 0.25;
+        engine.voices[0].detune_phase = 0.0;
+        let mut samples = Vec::with_capacity(44_100 * 4);
+        for _ in 0..(44_100 * 4) {
+            samples.push(engine.render(60, 1.0, true).0);
+        }
+        // 0.25 Hz, phase 0: +12 cents at 1s, -12 cents at 3s.
+        let sharp = rising_hz(&samples[44_100 - 2_000..44_100 + 2_000], 44_100.0);
+        let flat = rising_hz(&samples[44_100 * 3 - 2_000..44_100 * 3 + 2_000], 44_100.0);
+        assert!(
+            sharp > flat + 2.0,
+            "a held note should swing about three hertz, sharp {sharp} flat {flat}"
+        );
     }
 }
